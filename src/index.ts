@@ -18,28 +18,71 @@ import {
 import { RiskManager, type RiskConfig } from './risk';
 import { TradeJournal } from './journal';
 
+type BinanceEnvironment = 'testnet' | 'live';
+
+function getTradingSymbol(): string {
+  const symbol = (process.env.TRADING_SYMBOL || 'BTCUSDT').toUpperCase();
+
+  if (!/^[A-Z0-9]+$/.test(symbol)) {
+    throw new Error(`Invalid TRADING_SYMBOL value "${symbol}"`);
+  }
+
+  return symbol;
+}
+
+function getQuoteAsset(symbol: string): string {
+  const knownQuoteAssets = [
+    'USDT',
+    'USDC',
+    'FDUSD',
+    'TUSD',
+    'DAI',
+    'EUR',
+    'TRY',
+    'BRL',
+    'GBP',
+    'AUD',
+    'BUSD',
+    'BTC',
+    'ETH',
+    'BNB',
+  ];
+
+  const quoteAsset = knownQuoteAssets.find((asset) => symbol.endsWith(asset));
+  if (!quoteAsset) {
+    throw new Error(
+      `Unable to determine quote asset for symbol "${symbol}". Add support in getQuoteAsset().`
+    );
+  }
+
+  return quoteAsset;
+}
+
 class TradingSystem {
   private marketDataProvider: MarketDataProvider;
   private orderExecutor: OrderExecutor;
   private riskManager: RiskManager;
   private journal: TradeJournal;
   private openTradeIds: Map<string, string> = new Map();
-  private readonly symbol: string = 'BTCUSDT';
+  private readonly symbol: string;
   private readonly entrySignalThreshold: number = 0.05;
   private readonly quantityPrecision: number = 6;
+  private readonly maxHoldTimeMs: number = 15 * 60 * 1000;
 
   constructor(
     marketDataProvider: MarketDataProvider,
     executionConfig: ExecutionConfig,
     riskConfig: RiskConfig,
-    initialBalance: number
+    initialBalance: number,
+    symbol: string
   ) {
     this.marketDataProvider = marketDataProvider;
     this.orderExecutor = new OrderExecutor(executionConfig);
     this.riskManager = new RiskManager(riskConfig, initialBalance);
     this.journal = new TradeJournal();
+    this.symbol = symbol;
 
-    logger.info('Trading system initialized');
+    logger.info({ symbol }, 'Trading system initialized');
   }
 
   async runCycle(): Promise<void> {
@@ -207,6 +250,8 @@ class TradingSystem {
   ): string | null {
     const riskConfig = this.riskManager.getConfig();
     const priceChangePercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+    const openTradeId = this.openTradeIds.get(this.symbol);
+    const openTrade = openTradeId ? this.journal.getTrade(openTradeId) : undefined;
 
     if (priceChangePercent <= -riskConfig.stopLossPercent) {
       return `Stop loss triggered at ${priceChangePercent.toFixed(2)}%`;
@@ -218,6 +263,10 @@ class TradingSystem {
 
     if (signalAction === 'SELL') {
       return 'Strategy exit signal';
+    }
+
+    if (openTrade && Date.now() - openTrade.entryTime >= this.maxHoldTimeMs) {
+      return `Max hold time reached after ${(this.maxHoldTimeMs / 60000).toFixed(0)} minutes`;
     }
 
     return null;
@@ -274,19 +323,45 @@ class TradingSystem {
   }
 }
 
+function getBinanceEnvironment(): BinanceEnvironment {
+  const rawValue = (process.env.BINANCE_ENV || 'testnet').toLowerCase();
+
+  if (rawValue === 'live' || rawValue === 'production') {
+    return 'live';
+  }
+
+  if (rawValue === 'testnet') {
+    return 'testnet';
+  }
+
+  throw new Error(
+    `Invalid BINANCE_ENV value "${process.env.BINANCE_ENV}". Expected "testnet" or "live".`
+  );
+}
+
 // Main execution
 async function main(): Promise<void> {
+  const environment = getBinanceEnvironment();
+  const isLive = environment === 'live';
+  const tradingSymbol = getTradingSymbol();
+  const quoteAsset = getQuoteAsset(tradingSymbol);
+
   const executionConfig: ExecutionConfig = {
     apiKey: process.env.BINANCE_API_KEY || '',
     apiSecret: process.env.BINANCE_API_SECRET || '',
-    testnet: true,
+    testnet: !isLive,
+    baseURL: process.env.BINANCE_BASE_URL || undefined,
   };
+
+  if (!executionConfig.apiKey || !executionConfig.apiSecret) {
+    throw new Error('BINANCE_API_KEY and BINANCE_API_SECRET must be set');
+  }
 
   const riskConfig: RiskConfig = {
     maxPositionSize: 5,
     maxDrawdownPercent: 10,
-    stopLossPercent: 2,
-    takeProfitPercent: 5,
+    stopLossPercent: 1,
+    takeProfitPercent: 2.5,
     dailyLossLimit: 500,
     maxRiskPerTradePercent: 1,
     maxDailyLossPercent: 2,
@@ -295,21 +370,34 @@ async function main(): Promise<void> {
   const accountInfo: AccountInfo = await OrderExecutor.fetchAccountInfo(
     executionConfig
   );
-  const trackedAssets = ['USDT', 'BTC', 'BNB', 'ETH'];
   const balances = accountInfo.balances.filter(
     (balance: AccountBalance) =>
-      trackedAssets.includes(balance.asset) &&
       (balance.free > 0 || balance.locked > 0)
   );
-  const usdtBalance =
-    accountInfo.balances.find((balance) => balance.asset === 'USDT')?.free ?? 0;
+  const quoteAssetBalance =
+    accountInfo.balances.find((balance) => balance.asset === quoteAsset)?.free ?? 0;
+
+  if (quoteAssetBalance <= 0) {
+    throw new Error(
+      `No available ${quoteAsset} balance found for trading symbol ${tradingSymbol}`
+    );
+  }
 
   logger.info(
     {
+      environment,
+      tradingSymbol,
+      quoteAsset,
+      baseURL:
+        executionConfig.baseURL ||
+        (executionConfig.testnet
+          ? 'https://testnet.binance.vision/api/v3'
+          : 'https://api.binance.com/api/v3'),
       canTrade: accountInfo.canTrade,
       canWithdraw: accountInfo.canWithdraw,
       canDeposit: accountInfo.canDeposit,
       balances,
+      quoteAssetBalance,
     },
     'Fetched Binance account balances'
   );
@@ -318,7 +406,8 @@ async function main(): Promise<void> {
     new MarketDataProvider(),
     executionConfig,
     riskConfig,
-    usdtBalance
+    quoteAssetBalance,
+    tradingSymbol
   );
 
   // Run continuously with 60-second interval (adjust as needed)
