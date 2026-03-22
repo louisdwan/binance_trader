@@ -35,7 +35,8 @@ export class SimpleMovingAverageStrategy extends BaseStrategy {
 
     const currentPrice = this.candles[this.candles.length - 1].close;
     const diff = fastSMA - slowSMA;
-    const confidence = Math.min(Math.abs(diff / currentPrice), 1);
+    const crossoverStrength = slowSMA !== 0 ? Math.abs(diff / slowSMA) * 100 : 0;
+    const confidence = Math.min(crossoverStrength, 1);
 
     let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
     let reasoning = '';

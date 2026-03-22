@@ -9,7 +9,12 @@ import {
   SimpleMovingAverageStrategy,
   type StrategyConfig,
 } from './strategy';
-import { OrderExecutor, type ExecutionConfig } from './execution';
+import {
+  OrderExecutor,
+  type ExecutionConfig,
+  type AccountBalance,
+  type AccountInfo,
+} from './execution';
 import { RiskManager, type RiskConfig } from './risk';
 import { TradeJournal } from './journal';
 
@@ -18,6 +23,10 @@ class TradingSystem {
   private orderExecutor: OrderExecutor;
   private riskManager: RiskManager;
   private journal: TradeJournal;
+  private openTradeIds: Map<string, string> = new Map();
+  private readonly symbol: string = 'BTCUSDT';
+  private readonly entrySignalThreshold: number = 0.05;
+  private readonly quantityPrecision: number = 6;
 
   constructor(
     marketDataProvider: MarketDataProvider,
@@ -37,7 +46,7 @@ class TradingSystem {
     try {
       // Fetch market data
       const ticker: Ticker = await this.marketDataProvider.getTicker(
-        'BTCUSDT'
+        this.symbol
       );
       logger.info(
         { ticker },
@@ -46,7 +55,7 @@ class TradingSystem {
 
       // Get candle data for strategy analysis
       const candles: CandleData[] = await this.marketDataProvider.getCandles(
-        'BTCUSDT',
+        this.symbol,
         '1m',
         50
       );
@@ -58,7 +67,7 @@ class TradingSystem {
       // Create and run strategy
       const strategyConfig: StrategyConfig = {
         name: 'SMA Strategy',
-        symbol: 'BTCUSDT',
+        symbol: this.symbol,
         enabled: true,
         parameters: {
           fastPeriod: 5,
@@ -71,72 +80,80 @@ class TradingSystem {
       const signal = strategy.analyze();
       logger.info({ signal }, 'Strategy signal generated');
 
-      // Risk management
-      const riskMetrics = this.riskManager.getRiskMetrics();
-      logger.info(
-        { riskMetrics },
-        'Risk metrics calculated'
-      );
+      this.logRiskMetrics('Risk metrics before trade evaluation');
 
-      // Order execution (simulated)
-      if (signal.action === 'BUY' && signal.confidence > 0.5) {
-        const existingPosition = this.riskManager.getPosition('BTCUSDT');
-        if (existingPosition) {
-          this.riskManager.updatePositionPrice('BTCUSDT', ticker.price);
-          logger.info(
-            { symbol: 'BTCUSDT' },
-            'Skipping BUY because a position is already open'
-          );
-          return;
-        }
+      const existingPosition = this.riskManager.getPosition(this.symbol);
+      if (existingPosition) {
+        this.riskManager.updatePositionPrice(this.symbol, ticker.price);
 
-        if (!this.riskManager.validateRisk()) {
-          logger.warn('Skipping BUY because portfolio risk limits are exceeded');
-          return;
-        }
-
-        const quantity = 0.01;
-        if (!this.riskManager.canOpenPosition(quantity, ticker.price)) {
-          logger.warn(
-            { symbol: 'BTCUSDT', quantity, price: ticker.price },
-            'Skipping BUY because position would exceed exposure limits'
-          );
-          return;
-        }
-
-        const order = await this.orderExecutor.executeOrder({
-          symbol: 'BTCUSDT',
-          side: 'BUY',
-          type: 'MARKET',
-          quantity,
-          price: ticker.price,
-          status: 'PENDING',
-        });
-
-        logger.info({ order }, 'Order executed');
-        this.riskManager.openPosition(
-          order.symbol,
-          order.quantity,
-          order.averagePrice ?? ticker.price
+        const exitReason = this.getExitReason(
+          existingPosition.entryPrice,
+          ticker.price,
+          signal.action
         );
 
-        // Record in journal
-        this.journal.recordEntry({
-          id: order.id!,
-          symbol: 'BTCUSDT',
-          entryTime: order.timestamp,
-          entryPrice: order.averagePrice ?? ticker.price,
-          quantity: order.quantity,
-          side: 'BUY',
-          strategyName: strategy.getName(),
-          reason: signal.reasoning,
-          notes: `Confidence: ${signal.confidence.toFixed(2)}`,
-        });
-      } else {
-        const existingPosition = this.riskManager.getPosition('BTCUSDT');
-        if (existingPosition) {
-          this.riskManager.updatePositionPrice('BTCUSDT', ticker.price);
+        if (exitReason) {
+          await this.closePosition(ticker.price, exitReason);
+          this.logRiskMetrics('Risk metrics after closing position');
+          const stats = this.journal.calculateStats();
+          logger.info({ stats }, 'Trading cycle completed');
+          return;
         }
+      }
+
+      // Order execution (simulated)
+      if (signal.action === 'BUY' && signal.confidence >= this.entrySignalThreshold) {
+        if (!this.riskManager.validateRisk()) {
+          logger.warn('Skipping BUY because portfolio risk limits are exceeded');
+        } else if (!existingPosition) {
+          const quantity = this.calculateOrderQuantity(ticker.price);
+          if (!this.riskManager.canOpenPosition(quantity, ticker.price)) {
+            logger.warn(
+              { symbol: this.symbol, quantity, price: ticker.price },
+              'Skipping BUY because position would exceed exposure limits'
+            );
+          } else {
+            const order = await this.orderExecutor.executeOrder({
+              symbol: this.symbol,
+              side: 'BUY',
+              type: 'MARKET',
+              quantity,
+              price: ticker.price,
+              status: 'PENDING',
+            });
+
+            logger.info({ order }, 'Order executed');
+            this.riskManager.openPosition(
+              order.symbol,
+              order.quantity,
+              order.averagePrice ?? ticker.price
+            );
+
+            this.journal.recordEntry({
+              id: order.id!,
+              symbol: this.symbol,
+              entryTime: order.timestamp,
+              entryPrice: order.averagePrice ?? ticker.price,
+              quantity: order.quantity,
+              side: 'BUY',
+              strategyName: strategy.getName(),
+              reason: signal.reasoning,
+              notes: `Confidence: ${signal.confidence.toFixed(2)}`,
+            });
+            this.openTradeIds.set(this.symbol, order.id!);
+            this.logRiskMetrics('Risk metrics after opening position');
+          }
+        } else {
+          logger.info(
+            { symbol: this.symbol },
+            'Skipping BUY because a position is already open'
+          );
+        }
+      } else {
+        logger.info(
+          { action: signal.action, confidence: signal.confidence, threshold: this.entrySignalThreshold },
+          'No entry executed this cycle'
+        );
       }
 
       // Display journal stats
@@ -182,6 +199,79 @@ class TradingSystem {
   getRiskManager(): RiskManager {
     return this.riskManager;
   }
+
+  private getExitReason(
+    entryPrice: number,
+    currentPrice: number,
+    signalAction: 'BUY' | 'SELL' | 'HOLD'
+  ): string | null {
+    const riskConfig = this.riskManager.getConfig();
+    const priceChangePercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+    if (priceChangePercent <= -riskConfig.stopLossPercent) {
+      return `Stop loss triggered at ${priceChangePercent.toFixed(2)}%`;
+    }
+
+    if (priceChangePercent >= riskConfig.takeProfitPercent) {
+      return `Take profit triggered at ${priceChangePercent.toFixed(2)}%`;
+    }
+
+    if (signalAction === 'SELL') {
+      return 'Strategy exit signal';
+    }
+
+    return null;
+  }
+
+  private async closePosition(currentPrice: number, reason: string): Promise<void> {
+    const position = this.riskManager.getPosition(this.symbol);
+    if (!position) {
+      return;
+    }
+
+    const order = await this.orderExecutor.executeOrder({
+      symbol: this.symbol,
+      side: 'SELL',
+      type: 'MARKET',
+      quantity: position.quantity,
+      price: currentPrice,
+      status: 'PENDING',
+    });
+
+    logger.info({ order, reason }, 'Exit order executed');
+    this.riskManager.closePosition(this.symbol, order.averagePrice ?? currentPrice);
+
+    const tradeId = this.openTradeIds.get(this.symbol);
+    if (tradeId) {
+      this.journal.recordExit(
+        tradeId,
+        order.averagePrice ?? currentPrice,
+        order.timestamp
+      );
+      this.openTradeIds.delete(this.symbol);
+    }
+  }
+
+  private logRiskMetrics(message: string): void {
+    const riskMetrics = this.riskManager.getRiskMetrics();
+    logger.info({ riskMetrics }, message);
+  }
+
+  private calculateOrderQuantity(price: number): number {
+    const riskConfig = this.riskManager.getConfig();
+    const maxNotional =
+      this.riskManager.getAccountBalance() * (riskConfig.maxPositionSize / 100);
+    const rawQuantity = maxNotional / price;
+    const factor = 10 ** this.quantityPrecision;
+    const quantity = Math.floor(rawQuantity * factor) / factor;
+
+    logger.info(
+      { price, maxNotional, rawQuantity, quantity },
+      'Calculated dynamic order quantity'
+    );
+
+    return quantity;
+  }
 }
 
 // Main execution
@@ -202,11 +292,33 @@ async function main(): Promise<void> {
     maxDailyLossPercent: 2,
   };
 
+  const accountInfo: AccountInfo = await OrderExecutor.fetchAccountInfo(
+    executionConfig
+  );
+  const trackedAssets = ['USDT', 'BTC', 'BNB', 'ETH'];
+  const balances = accountInfo.balances.filter(
+    (balance: AccountBalance) =>
+      trackedAssets.includes(balance.asset) &&
+      (balance.free > 0 || balance.locked > 0)
+  );
+  const usdtBalance =
+    accountInfo.balances.find((balance) => balance.asset === 'USDT')?.free ?? 0;
+
+  logger.info(
+    {
+      canTrade: accountInfo.canTrade,
+      canWithdraw: accountInfo.canWithdraw,
+      canDeposit: accountInfo.canDeposit,
+      balances,
+    },
+    'Fetched Binance account balances'
+  );
+
   const system = new TradingSystem(
     new MarketDataProvider(),
     executionConfig,
     riskConfig,
-    10000 // Initial balance: $10,000
+    usdtBalance
   );
 
   // Run continuously with 60-second interval (adjust as needed)

@@ -22,3 +22,17 @@ export interface ExecutionConfig {
   baseURL?: string;
   testnet?: boolean;
 }
+
+export interface AccountBalance {
+  asset: string;
+  free: number;
+  locked: number;
+}
+
+export interface AccountInfo {
+  canTrade: boolean;
+  canWithdraw: boolean;
+  canDeposit: boolean;
+  updateTime: number;
+  balances: AccountBalance[];
+}

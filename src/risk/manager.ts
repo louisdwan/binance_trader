@@ -21,12 +21,12 @@ export class RiskManager {
       maxDailyLossPercent: config.maxDailyLossPercent ?? 2,
     };
 
-    this.accountBalance = initialBalance;
-    this.peakEquity = initialBalance;
+    this.accountBalance = this.ensureFinite(initialBalance, 'initialBalance');
+    this.peakEquity = this.accountBalance;
     this.currentDay = this.getDayKey(Date.now());
 
     logger.info(
-      { config: this.config, initialBalance },
+      { config: this.config, initialBalance: this.accountBalance },
       'RiskManager initialized'
     );
   }
@@ -38,19 +38,22 @@ export class RiskManager {
   ): Position {
     this.rollDayIfNeeded();
 
+    const safeQuantity = this.ensureFinite(quantity, `position quantity for ${symbol}`);
+    const safeEntryPrice = this.ensureFinite(entryPrice, `entry price for ${symbol}`);
+
     if (this.positions.has(symbol)) {
       throw new Error(`Position for ${symbol} already exists`);
     }
 
-    if (!this.canOpenPosition(quantity, entryPrice)) {
+    if (!this.canOpenPosition(safeQuantity, safeEntryPrice)) {
       throw new Error(`Position for ${symbol} exceeds risk limits`);
     }
 
     const position: Position = {
       symbol,
-      quantity,
-      entryPrice,
-      currentPrice: entryPrice,
+      quantity: safeQuantity,
+      entryPrice: safeEntryPrice,
+      currentPrice: safeEntryPrice,
       unrealizedPnL: 0,
       unrealizedPnLPercent: 0,
     };
@@ -59,7 +62,7 @@ export class RiskManager {
     this.updatePeakEquity();
 
     logger.info(
-      { symbol, quantity, entryPrice },
+      { symbol, quantity: safeQuantity, entryPrice: safeEntryPrice },
       'Position opened'
     );
 
@@ -75,7 +78,11 @@ export class RiskManager {
       return null;
     }
 
-    const pnl = (exitPrice - position.entryPrice) * position.quantity;
+    const safeExitPrice = this.ensureFinite(exitPrice, `exit price for ${symbol}`);
+    const pnl = this.ensureFinite(
+      (safeExitPrice - position.entryPrice) * position.quantity,
+      `realized pnl for ${symbol}`
+    );
     this.realizedPnL += pnl;
     this.dailyRealizedPnL += pnl;
     this.accountBalance += pnl;
@@ -84,7 +91,7 @@ export class RiskManager {
     this.updatePeakEquity();
 
     logger.info(
-      { symbol, exitPrice, pnl },
+      { symbol, exitPrice: safeExitPrice, pnl },
       'Position closed'
     );
 
@@ -99,11 +106,22 @@ export class RiskManager {
       return;
     }
 
-    position.currentPrice = currentPrice;
-    position.unrealizedPnL =
-      (currentPrice - position.entryPrice) * position.quantity;
-    position.unrealizedPnLPercent =
-      ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+    const safeCurrentPrice = this.ensureFinite(
+      currentPrice,
+      `current price for ${symbol}`
+    );
+
+    position.currentPrice = safeCurrentPrice;
+    position.unrealizedPnL = this.ensureFinite(
+      (safeCurrentPrice - position.entryPrice) * position.quantity,
+      `unrealized pnl for ${symbol}`
+    );
+    position.unrealizedPnLPercent = position.entryPrice !== 0
+      ? this.ensureFinite(
+          ((safeCurrentPrice - position.entryPrice) / position.entryPrice) * 100,
+          `unrealized pnl percent for ${symbol}`
+        )
+      : 0;
     this.updatePeakEquity();
   }
 
@@ -116,7 +134,9 @@ export class RiskManager {
   }
 
   canOpenPosition(quantity: number, price: number): boolean {
-    const notionalValue = quantity * price;
+    const safeQuantity = this.ensureFinite(quantity, 'position size check quantity');
+    const safePrice = this.ensureFinite(price, 'position size check price');
+    const notionalValue = safeQuantity * safePrice;
     const currentExposure = Array.from(this.positions.values()).reduce(
       (sum, position) => sum + position.quantity * position.currentPrice,
       0
@@ -128,25 +148,35 @@ export class RiskManager {
 
   getRiskMetrics(): RiskMetrics {
     const positions = Array.from(this.positions.values());
-    const totalExposure = positions.reduce(
-      (sum, pos) => sum + pos.quantity * pos.currentPrice,
-      0
+    const totalExposure = this.ensureFinite(
+      positions.reduce((sum, pos) => sum + pos.quantity * pos.currentPrice, 0),
+      'total exposure'
     );
-    const unrealizedPnL = positions.reduce(
-      (sum, pos) => sum + pos.unrealizedPnL,
-      0
+    const unrealizedPnL = this.ensureFinite(
+      positions.reduce((sum, pos) => sum + pos.unrealizedPnL, 0),
+      'unrealized pnl total'
     );
 
-    const equity = this.accountBalance + unrealizedPnL;
-    this.peakEquity = Math.max(this.peakEquity, equity);
-    const drawdown = Math.max(0, this.peakEquity - equity);
-    const drawdownPercent =
-      this.peakEquity > 0 ? (drawdown / this.peakEquity) * 100 : 0;
+    const equity = this.ensureFinite(
+      this.accountBalance + unrealizedPnL,
+      'portfolio equity'
+    );
+    this.peakEquity = this.ensureFinite(
+      Math.max(this.peakEquity, equity),
+      'peak equity'
+    );
+    const drawdown = this.ensureFinite(
+      Math.max(0, this.peakEquity - equity),
+      'drawdown'
+    );
+    const drawdownPercent = this.peakEquity > 0
+      ? this.ensureFinite((drawdown / this.peakEquity) * 100, 'drawdown percent')
+      : 0;
 
     return {
       totalPositions: positions.length,
       totalExposure,
-      realizedPnL: this.realizedPnL,
+      realizedPnL: this.ensureFinite(this.realizedPnL, 'realized pnl total'),
       unrealizedPnL,
       drawdown,
       drawdownPercent,
@@ -157,24 +187,43 @@ export class RiskManager {
     return this.accountBalance;
   }
 
+  getConfig(): RiskConfig {
+    return { ...this.config };
+  }
+
   calculatePositionSize(balance: number, stopDistance: number): number {
-    if (balance <= 0 || stopDistance <= 0) {
+    const safeBalance = this.ensureFinite(balance, 'position sizing balance');
+    const safeStopDistance = this.ensureFinite(
+      stopDistance,
+      'position sizing stop distance'
+    );
+
+    if (safeBalance <= 0 || safeStopDistance <= 0) {
       throw new Error('Balance and stopDistance must be positive numbers');
     }
 
-    const riskPerTrade = (this.config.maxRiskPerTradePercent / 100) * balance;
-    const rawSize = riskPerTrade / stopDistance;
+    const riskPerTrade =
+      (this.config.maxRiskPerTradePercent / 100) * safeBalance;
+    const rawSize = riskPerTrade / safeStopDistance;
     const positionSize = Math.max(0, rawSize);
 
-    return positionSize;
+    return this.ensureFinite(positionSize, 'position size');
   }
 
   validateRisk(): boolean {
     this.rollDayIfNeeded();
     const metrics = this.getRiskMetrics();
-    const dailyLoss = Math.max(0, -this.dailyRealizedPnL);
+    const dailyLoss = this.ensureFinite(
+      Math.max(0, -this.dailyRealizedPnL),
+      'daily loss'
+    );
     const dailyLossPercent =
-      this.peakEquity > 0 ? (dailyLoss / this.peakEquity) * 100 : 0;
+      this.peakEquity > 0
+        ? this.ensureFinite(
+            (dailyLoss / this.peakEquity) * 100,
+            'daily loss percent'
+          )
+        : 0;
 
     if (metrics.drawdownPercent > this.config.maxDrawdownPercent) {
       logger.warn(
@@ -209,7 +258,10 @@ export class RiskManager {
       0
     );
 
-    return this.accountBalance + unrealizedPnL;
+    return this.ensureFinite(
+      this.accountBalance + unrealizedPnL,
+      'equity calculation'
+    );
   }
 
   private updatePeakEquity(): void {
@@ -226,5 +278,14 @@ export class RiskManager {
       this.currentDay = currentDay;
       this.dailyRealizedPnL = 0;
     }
+  }
+
+  private ensureFinite(value: number, label: string): number {
+    if (Number.isFinite(value)) {
+      return value;
+    }
+
+    logger.warn({ label, value }, 'Non-finite risk value encountered; clamping to 0');
+    return 0;
   }
 }

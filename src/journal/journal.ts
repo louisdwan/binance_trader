@@ -6,6 +6,14 @@ export class TradeJournal {
   private tradeMap: Map<string, TradeEntry> = new Map();
 
   recordEntry(trade: TradeEntry): void {
+    trade.entryPrice = this.ensureFinite(
+      trade.entryPrice,
+      `entry price for trade ${trade.id}`
+    );
+    trade.quantity = this.ensureFinite(
+      trade.quantity,
+      `quantity for trade ${trade.id}`
+    );
     this.trades.push(trade);
     this.tradeMap.set(trade.id, trade);
 
@@ -34,17 +42,30 @@ export class TradeJournal {
       return null;
     }
 
-    trade.exitPrice = exitPrice;
+    const safeExitPrice = this.ensureFinite(exitPrice, `exit price for trade ${tradeId}`);
+    trade.exitPrice = safeExitPrice;
     trade.exitTime = exitTime;
 
     // Calculate PnL
     if (trade.side === 'BUY') {
-      trade.pnl = (exitPrice - trade.entryPrice) * trade.quantity;
+      trade.pnl = this.ensureFinite(
+        (safeExitPrice - trade.entryPrice) * trade.quantity,
+        `pnl for trade ${tradeId}`
+      );
     } else {
-      trade.pnl = (trade.entryPrice - exitPrice) * trade.quantity;
+      trade.pnl = this.ensureFinite(
+        (trade.entryPrice - safeExitPrice) * trade.quantity,
+        `pnl for trade ${tradeId}`
+      );
     }
 
-    trade.pnlPercent = (trade.pnl / (trade.entryPrice * trade.quantity)) * 100;
+    const notional = trade.entryPrice * trade.quantity;
+    trade.pnlPercent = notional !== 0
+      ? this.ensureFinite(
+          (trade.pnl / notional) * 100,
+          `pnl percent for trade ${tradeId}`
+        )
+      : 0;
 
     logger.info(
       { tradeId, pnl: trade.pnl, pnlPercent: trade.pnlPercent },
@@ -71,7 +92,7 @@ export class TradeJournal {
   }
 
   getClosedTrades(): TradeEntry[] {
-    return this.trades.filter((trade) => trade.exitPrice);
+    return this.trades.filter((trade) => trade.exitPrice !== undefined);
   }
 
   calculateStats(): JournalStats {
@@ -92,31 +113,49 @@ export class TradeJournal {
 
     const winningTrades = closedTrades.filter((trade) => trade.pnl! > 0);
     const losingTrades = closedTrades.filter((trade) => trade.pnl! < 0);
-    const totalPnL = closedTrades.reduce((sum, trade) => sum + trade.pnl!, 0);
-
-    const grossProfit = winningTrades.reduce(
-      (sum, trade) => sum + trade.pnl!,
-      0
+    const totalPnL = this.ensureFinite(
+      closedTrades.reduce((sum, trade) => sum + this.ensureFinite(trade.pnl ?? 0, `trade pnl ${trade.id}`), 0),
+      'journal total pnl'
     );
-    const grossLoss = Math.abs(
-      losingTrades.reduce((sum, trade) => sum + trade.pnl!, 0)
+
+    const grossProfit = this.ensureFinite(
+      winningTrades.reduce(
+        (sum, trade) => sum + this.ensureFinite(trade.pnl ?? 0, `winning trade pnl ${trade.id}`),
+        0
+      ),
+      'journal gross profit'
+    );
+    const grossLoss = this.ensureFinite(
+      Math.abs(
+        losingTrades.reduce(
+          (sum, trade) => sum + this.ensureFinite(trade.pnl ?? 0, `losing trade pnl ${trade.id}`),
+          0
+        )
+      ),
+      'journal gross loss'
     );
 
     return {
       totalTrades: closedTrades.length,
       winningTrades: winningTrades.length,
       losingTrades: losingTrades.length,
-      winRate: (winningTrades.length / closedTrades.length) * 100,
+      winRate: this.ensureFinite(
+        (winningTrades.length / closedTrades.length) * 100,
+        'journal win rate'
+      ),
       totalPnL,
       averageWin:
         winningTrades.length > 0
-          ? grossProfit / winningTrades.length
+          ? this.ensureFinite(grossProfit / winningTrades.length, 'journal average win')
           : 0,
       averageLoss:
         losingTrades.length > 0
-          ? -grossLoss / losingTrades.length
+          ? this.ensureFinite(-grossLoss / losingTrades.length, 'journal average loss')
           : 0,
-      profitFactor: grossLoss > 0 ? grossProfit / grossLoss : 0,
+      profitFactor:
+        grossLoss > 0
+          ? this.ensureFinite(grossProfit / grossLoss, 'journal profit factor')
+          : 0,
     };
   }
 
@@ -146,8 +185,8 @@ export class TradeJournal {
       trade.exitPrice || '',
       trade.quantity,
       trade.side,
-      trade.pnl || '',
-      trade.pnlPercent?.toFixed(2) || '',
+      trade.pnl ?? '',
+      trade.pnlPercent !== undefined ? trade.pnlPercent.toFixed(2) : '',
       trade.strategyName,
       trade.reason || '',
       trade.notes || '',
@@ -159,5 +198,14 @@ export class TradeJournal {
     ].join('\n');
 
     return csv;
+  }
+
+  private ensureFinite(value: number, label: string): number {
+    if (Number.isFinite(value)) {
+      return value;
+    }
+
+    logger.warn({ label, value }, 'Non-finite journal value encountered; clamping to 0');
+    return 0;
   }
 }
