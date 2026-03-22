@@ -121,7 +121,7 @@ export class PriceDatabase {
 
       const rows: PriceRecord[] = [];
       while (stmt.step()) {
-        const row = stmt.getAsObject() as PriceRecord;
+        const row = stmt.getAsObject() as unknown as PriceRecord;
         rows.push(row);
       }
       stmt.free();
@@ -150,7 +150,7 @@ export class PriceDatabase {
 
       const rows: PriceRecord[] = [];
       while (stmt.step()) {
-        const row = stmt.getAsObject() as PriceRecord;
+        const row = stmt.getAsObject() as unknown as PriceRecord;
         rows.push(row);
       }
       stmt.free();
@@ -202,7 +202,7 @@ export class PriceDatabase {
 
       let row: PriceRecord | null = null;
       if (stmt.step()) {
-        row = stmt.getAsObject() as PriceRecord;
+        row = stmt.getAsObject() as unknown as PriceRecord;
       }
       stmt.free();
 
