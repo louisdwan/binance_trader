@@ -33,10 +33,9 @@ class TradingSystem {
     logger.info('Trading system initialized');
   }
 
-  async runExample(): Promise<void> {
+  async runCycle(): Promise<void> {
     try {
-      // Example: Fetch market data
-      logger.info('Fetching market data...');
+      // Fetch market data
       const ticker: Ticker = await this.marketDataProvider.getTicker(
         'BTCUSDT'
       );
@@ -45,10 +44,10 @@ class TradingSystem {
         'Market data fetched successfully'
       );
 
-      // Example: Get candle data for strategy analysis
+      // Get candle data for strategy analysis
       const candles: CandleData[] = await this.marketDataProvider.getCandles(
         'BTCUSDT',
-        '1h',
+        '1m',
         50
       );
       logger.info(
@@ -56,7 +55,7 @@ class TradingSystem {
         'Candle data retrieved'
       );
 
-      // Example: Create and run strategy
+      // Create and run strategy
       const strategyConfig: StrategyConfig = {
         name: 'SMA Strategy',
         symbol: 'BTCUSDT',
@@ -72,48 +71,104 @@ class TradingSystem {
       const signal = strategy.analyze();
       logger.info({ signal }, 'Strategy signal generated');
 
-      // Example: Risk management
+      // Risk management
       const riskMetrics = this.riskManager.getRiskMetrics();
       logger.info(
         { riskMetrics },
         'Risk metrics calculated'
       );
 
-      // Example: Order execution (simulated)
+      // Order execution (simulated)
       if (signal.action === 'BUY' && signal.confidence > 0.5) {
+        const existingPosition = this.riskManager.getPosition('BTCUSDT');
+        if (existingPosition) {
+          this.riskManager.updatePositionPrice('BTCUSDT', ticker.price);
+          logger.info(
+            { symbol: 'BTCUSDT' },
+            'Skipping BUY because a position is already open'
+          );
+          return;
+        }
+
+        if (!this.riskManager.validateRisk()) {
+          logger.warn('Skipping BUY because portfolio risk limits are exceeded');
+          return;
+        }
+
+        const quantity = 0.01;
+        if (!this.riskManager.canOpenPosition(quantity, ticker.price)) {
+          logger.warn(
+            { symbol: 'BTCUSDT', quantity, price: ticker.price },
+            'Skipping BUY because position would exceed exposure limits'
+          );
+          return;
+        }
+
         const order = await this.orderExecutor.executeOrder({
           symbol: 'BTCUSDT',
           side: 'BUY',
           type: 'MARKET',
-          quantity: 0.01,
-          timestamp: Date.now(),
+          quantity,
+          price: ticker.price,
           status: 'PENDING',
         });
 
         logger.info({ order }, 'Order executed');
+        this.riskManager.openPosition(
+          order.symbol,
+          order.quantity,
+          order.averagePrice ?? ticker.price
+        );
 
         // Record in journal
         this.journal.recordEntry({
           id: order.id!,
           symbol: 'BTCUSDT',
           entryTime: order.timestamp,
-          entryPrice: ticker.price,
+          entryPrice: order.averagePrice ?? ticker.price,
           quantity: order.quantity,
           side: 'BUY',
           strategyName: strategy.getName(),
+          reason: signal.reasoning,
           notes: `Confidence: ${signal.confidence.toFixed(2)}`,
         });
+      } else {
+        const existingPosition = this.riskManager.getPosition('BTCUSDT');
+        if (existingPosition) {
+          this.riskManager.updatePositionPrice('BTCUSDT', ticker.price);
+        }
       }
 
       // Display journal stats
       const stats = this.journal.calculateStats();
-      logger.info({ stats }, 'Trading journal stats');
-
-      logger.info('Example trading cycle completed successfully');
+      logger.info({ stats }, 'Trading cycle completed');
     } catch (error) {
-      logger.error({ error }, 'Error in trading system');
+      logger.error({ error }, 'Error in trading cycle');
       throw error;
     }
+  }
+
+  async runContinuous(intervalMs: number = 60000): Promise<void> {
+    logger.info(
+      { intervalMs },
+      'Starting continuous trading system (interval in ms)'
+    );
+
+    // Run once immediately
+    await this.runCycle();
+
+    // Then run on interval
+    setInterval(async () => {
+      try {
+        await this.runCycle();
+      } catch (error) {
+        logger.error({ error }, 'Error in continuous trading cycle');
+        // Continue running despite error
+      }
+    }, intervalMs);
+
+    // Never exit
+    await new Promise(() => {});
   }
 
   getJournal(): TradeJournal {
@@ -143,6 +198,8 @@ async function main(): Promise<void> {
     stopLossPercent: 2,
     takeProfitPercent: 5,
     dailyLossLimit: 500,
+    maxRiskPerTradePercent: 1,
+    maxDailyLossPercent: 2,
   };
 
   const system = new TradingSystem(
@@ -152,7 +209,8 @@ async function main(): Promise<void> {
     10000 // Initial balance: $10,000
   );
 
-  await system.runExample();
+  // Run continuously with 60-second interval (adjust as needed)
+  await system.runContinuous(60000);
 }
 
 main().catch((error) => {

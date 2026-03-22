@@ -1,5 +1,5 @@
 import logger from '../logger';
-import type { Order, OrderStatus, ExecutionConfig } from './types';
+import type { Order, ExecutionConfig } from './types';
 
 export class OrderExecutor {
   private config: ExecutionConfig;
@@ -19,10 +19,10 @@ export class OrderExecutor {
       ...order,
       id: this.generateOrderId(),
       timestamp: Date.now(),
-      status: 'PENDING',
+      status: order.status ?? 'PENDING',
     };
 
-    this.orders.set(executedOrder.id, executedOrder);
+    this.orders.set(executedOrder.id as string, executedOrder);
 
     try {
       // Simulate order execution
@@ -48,6 +48,14 @@ export class OrderExecutor {
       throw new Error(`Order ${orderId} not found`);
     }
 
+    if (order.status === 'FILLED' || order.status === 'FAILED') {
+      throw new Error(`Order ${orderId} cannot be cancelled from status ${order.status}`);
+    }
+
+    if (order.status === 'CANCELLED') {
+      return order;
+    }
+
     order.status = 'CANCELLED';
     logger.info({ orderId }, 'Order cancelled');
 
@@ -64,7 +72,7 @@ export class OrderExecutor {
 
   getOpenOrders(): Order[] {
     return Array.from(this.orders.values()).filter(
-      (order) => order.status === 'OPEN'
+      (order) => order.status === 'OPEN' || order.status === 'PENDING'
     );
   }
 
@@ -72,9 +80,13 @@ export class OrderExecutor {
     // Simulate a brief delay for order processing
     await new Promise((resolve) => setTimeout(resolve, 100));
 
+    if (order.status === 'CANCELLED') {
+      return;
+    }
+
     order.status = 'FILLED';
     order.filledQuantity = order.quantity;
-    order.averagePrice = order.price || 0;
+    order.averagePrice = order.price;
   }
 
   private generateOrderId(): string {

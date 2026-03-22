@@ -1,5 +1,5 @@
 import logger from '../logger';
-import type { Order, OrderSide, OrderStatus } from './types';
+import type { OrderSide, OrderStatus } from './types';
 
 export interface PaperTradeConfig {
   startingBalance: number;
@@ -23,6 +23,7 @@ export class PaperTrader {
   private balance: number;
   private baseCurrencyBalance: number; // e.g., USD balance
   private quoteBalance: Record<string, number> = {}; // e.g., BTC balance by symbol
+  private averageEntryPrice: Record<string, number> = {};
   private feePercent: number;
   private trades: ExecutedTrade[] = [];
   private tradeCounter = 0;
@@ -67,8 +68,13 @@ export class PaperTrader {
       }
 
       this.baseCurrencyBalance -= cost;
+      const existingQty = this.quoteBalance[symbol] ?? 0;
+      const existingCostBasis = (this.averageEntryPrice[symbol] ?? 0) * existingQty;
+      const newQty = existingQty + quantity;
+
+      this.quoteBalance[symbol] = newQty;
+      this.averageEntryPrice[symbol] = (existingCostBasis + notional) / newQty;
       this.balance = this.baseCurrencyBalance + this.liquidateQuotes(price); // base + quote value
-      this.quoteBalance[symbol] = (this.quoteBalance[symbol] ?? 0) + quantity;
 
       logger.info(
         { symbol, side, price, quantity, cost, fee, balance: this.balance },
@@ -82,13 +88,17 @@ export class PaperTrader {
       }
 
       const proceeds = notional - fee;
+      const averageEntryPrice = this.averageEntryPrice[symbol] ?? price;
       this.quoteBalance[symbol] = availableQty - quantity;
+
+      if (this.quoteBalance[symbol] === 0) {
+        delete this.quoteBalance[symbol];
+        delete this.averageEntryPrice[symbol];
+      }
+
       this.baseCurrencyBalance += proceeds;
       this.balance = this.baseCurrencyBalance + this.liquidateQuotes(price);
-
-      // Calculate realized PnL from this sale relative to entry cost basis
-      // Simplified formula: we don't track actual cost basis by trade series; assume immediate PnL based on current price.
-      pnl = proceeds - notional;
+      pnl = (price - averageEntryPrice) * quantity - fee;
 
       logger.info(
         { symbol, side, price, quantity, proceeds, fee, balance: this.balance, pnl },
@@ -115,12 +125,14 @@ export class PaperTrader {
   }
 
   private liquidateQuotes(latestPrice: number): number {
-    // Estimate total value of all quote balances
-    const total = Object.entries(this.quoteBalance).reduce((acc, [symbol, qty]) => {
-      let mktPrice = latestPrice;
-      // If not BTC/USDT, no direct mapping. Here we use latestPrice by default.
-      return acc + qty * mktPrice;
-    }, 0);
+    // Estimate total value of all quote balances using the latest observed price.
+    // This stays a single-price approximation until symbol-specific marks are tracked.
+    const total = Object.entries(this.quoteBalance).reduce(
+      (acc, [, qty]) => {
+        return acc + qty * latestPrice;
+      },
+      0
+    );
 
     return total;
   }

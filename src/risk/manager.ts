@@ -6,6 +6,9 @@ export class RiskManager {
   private positions: Map<string, Position> = new Map();
   private accountBalance: number;
   private realizedPnL: number = 0;
+  private dailyRealizedPnL: number = 0;
+  private peakEquity: number;
+  private currentDay: string;
 
   constructor(config: RiskConfig, initialBalance: number) {
     this.config = {
@@ -19,6 +22,8 @@ export class RiskManager {
     };
 
     this.accountBalance = initialBalance;
+    this.peakEquity = initialBalance;
+    this.currentDay = this.getDayKey(Date.now());
 
     logger.info(
       { config: this.config, initialBalance },
@@ -31,6 +36,16 @@ export class RiskManager {
     quantity: number,
     entryPrice: number
   ): Position {
+    this.rollDayIfNeeded();
+
+    if (this.positions.has(symbol)) {
+      throw new Error(`Position for ${symbol} already exists`);
+    }
+
+    if (!this.canOpenPosition(quantity, entryPrice)) {
+      throw new Error(`Position for ${symbol} exceeds risk limits`);
+    }
+
     const position: Position = {
       symbol,
       quantity,
@@ -41,6 +56,7 @@ export class RiskManager {
     };
 
     this.positions.set(symbol, position);
+    this.updatePeakEquity();
 
     logger.info(
       { symbol, quantity, entryPrice },
@@ -51,6 +67,7 @@ export class RiskManager {
   }
 
   closePosition(symbol: string, exitPrice: number): Position | null {
+    this.rollDayIfNeeded();
     const position = this.positions.get(symbol);
 
     if (!position) {
@@ -60,9 +77,11 @@ export class RiskManager {
 
     const pnl = (exitPrice - position.entryPrice) * position.quantity;
     this.realizedPnL += pnl;
+    this.dailyRealizedPnL += pnl;
     this.accountBalance += pnl;
 
     this.positions.delete(symbol);
+    this.updatePeakEquity();
 
     logger.info(
       { symbol, exitPrice, pnl },
@@ -73,6 +92,7 @@ export class RiskManager {
   }
 
   updatePositionPrice(symbol: string, currentPrice: number): void {
+    this.rollDayIfNeeded();
     const position = this.positions.get(symbol);
 
     if (!position) {
@@ -84,6 +104,7 @@ export class RiskManager {
       (currentPrice - position.entryPrice) * position.quantity;
     position.unrealizedPnLPercent =
       ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+    this.updatePeakEquity();
   }
 
   getPosition(symbol: string): Position | undefined {
@@ -96,10 +117,13 @@ export class RiskManager {
 
   canOpenPosition(quantity: number, price: number): boolean {
     const notionalValue = quantity * price;
-    const exposureLimit =
-      this.accountBalance * (this.config.maxPositionSize / 100);
+    const currentExposure = Array.from(this.positions.values()).reduce(
+      (sum, position) => sum + position.quantity * position.currentPrice,
+      0
+    );
+    const exposureLimit = this.getEquity() * (this.config.maxPositionSize / 100);
 
-    return notionalValue <= exposureLimit;
+    return currentExposure + notionalValue <= exposureLimit;
   }
 
   getRiskMetrics(): RiskMetrics {
@@ -113,14 +137,11 @@ export class RiskManager {
       0
     );
 
-    const maxBalance =
-      this.accountBalance +
-      Math.abs(Math.max(0, -unrealizedPnL, -this.realizedPnL));
-    const drawdown = Math.max(
-      0,
-      -unrealizedPnL - this.realizedPnL
-    );
-    const drawdownPercent = (drawdown / maxBalance) * 100;
+    const equity = this.accountBalance + unrealizedPnL;
+    this.peakEquity = Math.max(this.peakEquity, equity);
+    const drawdown = Math.max(0, this.peakEquity - equity);
+    const drawdownPercent =
+      this.peakEquity > 0 ? (drawdown / this.peakEquity) * 100 : 0;
 
     return {
       totalPositions: positions.length,
@@ -142,19 +163,18 @@ export class RiskManager {
     }
 
     const riskPerTrade = (this.config.maxRiskPerTradePercent / 100) * balance;
-    const maxDailyRisk = (this.config.maxDailyLossPercent / 100) * balance;
-
-    // Whether single trade risk is capped to max risk percentages.
     const rawSize = riskPerTrade / stopDistance;
-
-    // add buffer for scenario enforcement (like before daily threshold)
     const positionSize = Math.max(0, rawSize);
 
     return positionSize;
   }
 
   validateRisk(): boolean {
+    this.rollDayIfNeeded();
     const metrics = this.getRiskMetrics();
+    const dailyLoss = Math.max(0, -this.dailyRealizedPnL);
+    const dailyLossPercent =
+      this.peakEquity > 0 ? (dailyLoss / this.peakEquity) * 100 : 0;
 
     if (metrics.drawdownPercent > this.config.maxDrawdownPercent) {
       logger.warn(
@@ -164,6 +184,47 @@ export class RiskManager {
       return false;
     }
 
+    if (dailyLoss > this.config.dailyLossLimit) {
+      logger.warn(
+        { dailyLoss, dailyLossLimit: this.config.dailyLossLimit },
+        'Daily loss limit exceeded'
+      );
+      return false;
+    }
+
+    if (dailyLossPercent > this.config.maxDailyLossPercent) {
+      logger.warn(
+        { dailyLossPercent, maxDailyLossPercent: this.config.maxDailyLossPercent },
+        'Daily percentage loss limit exceeded'
+      );
+      return false;
+    }
+
     return true;
+  }
+
+  private getEquity(): number {
+    const unrealizedPnL = Array.from(this.positions.values()).reduce(
+      (sum, position) => sum + position.unrealizedPnL,
+      0
+    );
+
+    return this.accountBalance + unrealizedPnL;
+  }
+
+  private updatePeakEquity(): void {
+    this.peakEquity = Math.max(this.peakEquity, this.getEquity());
+  }
+
+  private getDayKey(timestamp: number): string {
+    return new Date(timestamp).toISOString().slice(0, 10);
+  }
+
+  private rollDayIfNeeded(): void {
+    const currentDay = this.getDayKey(Date.now());
+    if (currentDay !== this.currentDay) {
+      this.currentDay = currentDay;
+      this.dailyRealizedPnL = 0;
+    }
   }
 }

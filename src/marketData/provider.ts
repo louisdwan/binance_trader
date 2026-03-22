@@ -71,7 +71,7 @@ export class MarketDataProvider {
         high: parseFloat(candle[2]),
         low: parseFloat(candle[3]),
         close: parseFloat(candle[4]),
-        volume: parseFloat(candle[7]),
+        volume: parseFloat(candle[5]),
       }));
     } catch (error) {
       logger.error({ error, symbol, interval }, 'Failed to fetch candles');

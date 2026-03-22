@@ -31,7 +31,7 @@ export class BinanceWebSocket extends EventEmitter {
 
   constructor(config: WebSocketConfig = {}) {
     super();
-    this.baseURL = config.baseURL || 'wss://stream.binance.com:9443/ws';
+    this.baseURL = config.baseURL || 'wss://stream.binance.com:9443';
     this.reconnectInterval = config.reconnectInterval || 5000;
     this.maxReconnectAttempts = config.maxReconnectAttempts || 10;
     this.heartbeatInterval = config.heartbeatInterval || 30000;
@@ -46,11 +46,10 @@ export class BinanceWebSocket extends EventEmitter {
     this.isIntentionallyClosed = false;
     this.symbols = new Set(symbols.map((s) => s.toLowerCase()));
 
-    const streams = Array.from(this.symbols)
-      .map((symbol) => `${symbol}@ticker`)
-      .join('/');
-
-    const url = `${this.baseURL}/${streams}`;
+    const streams = Array.from(this.symbols).map((symbol) => `${symbol}@ticker`);
+    const url = streams.length === 1
+      ? `${this.baseURL}/ws/${streams[0]}`
+      : `${this.baseURL}/stream?streams=${streams.join('/')}`;
 
     logger.info({ url, symbols: Array.from(this.symbols) }, 'Connecting to Binance WebSocket');
 
@@ -58,8 +57,8 @@ export class BinanceWebSocket extends EventEmitter {
       this.ws = new WebSocket(url);
 
       this.ws.on('open', () => this.handleOpen());
-      this.ws.on('message', (data) => this.handleMessage(data.toString()));
-      this.ws.on('error', (error) => this.handleError(error));
+      this.ws.on('message', (data: unknown) => this.handleMessage((data as Buffer).toString()));
+      this.ws.on('error', (error: unknown) => this.handleError(error as Error));
       this.ws.on('close', () => this.handleClose());
     } catch (error) {
       logger.error({ error }, 'Failed to create WebSocket connection');
@@ -155,19 +154,20 @@ export class BinanceWebSocket extends EventEmitter {
   private handleMessage(data: string): void {
     try {
       const parsed = JSON.parse(data);
+      const payload = parsed.data ?? parsed;
 
       // Skip non-ticker messages
-      if (!parsed.e || parsed.e !== '24hrTicker') {
+      if (!payload.e || payload.e !== '24hrTicker') {
         return;
       }
 
       const update: PriceUpdate = {
-        symbol: parsed.s,
-        price: parseFloat(parsed.c),
-        timestamp: parsed.E,
-        bid: parseFloat(parsed.b),
-        ask: parseFloat(parsed.a),
-        volume: parseFloat(parsed.v),
+        symbol: payload.s,
+        price: parseFloat(payload.c),
+        timestamp: payload.E,
+        bid: parseFloat(payload.b),
+        ask: parseFloat(payload.a),
+        volume: parseFloat(payload.v),
       };
 
       // Log to console with formatted output

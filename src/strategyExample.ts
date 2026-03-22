@@ -38,13 +38,13 @@ async function main(): Promise<void> {
       // Get the 200 most recent prices
       const prices = db.getPricesBySymbol(symbol, 200);
 
-      if (prices.length < 50) {
+      if (prices.length < 200) {
         logger.warn(
           {
             symbol,
             priceCount: prices.length,
           },
-          'Insufficient data for analysis (need at least 50 prices)'
+          'Insufficient data for analysis (need at least 200 prices)'
         );
         continue;
       }
