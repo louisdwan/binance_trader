@@ -1,0 +1,43 @@
+{
+  "name": "binance-trader",
+  "version": "1.0.0",
+  "description": "Advanced trading system with clean modular architecture",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "stream": "tsx watch src/websocketExample.ts",
+    "analyze": "tsx src/strategyExample.ts",
+    "paper": "tsx src/executionExample.ts",
+    "journal": "tsx src/journalExample.ts",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write src"
+  },
+  "keywords": [
+    "trading",
+    "binance",
+    "crypto",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.2",
+    "pino": "^8.16.2",
+    "pino-pretty": "^10.3.1",
+    "ws": "^8.16.0",
+    "sql.js": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.4",
+    "typescript": "^5.3.3",
+    "tsx": "^4.7.0",
+    "eslint": "^8.55.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.2",
+    "@typescript-eslint/parser": "^6.13.2",
+    "prettier": "^3.1.0"
+  }
+}
