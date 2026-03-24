@@ -21,6 +21,8 @@ export interface ExecutionConfig {
   apiSecret: string;
   baseURL?: string;
   testnet?: boolean;
+  dryRun?: boolean;
+  recvWindow?: number;
 }
 
 export interface AccountBalance {

@@ -1,5 +1,5 @@
 import logger from '../logger';
-import type { RiskConfig, Position, RiskMetrics } from './types';
+import type { RiskConfig, Position, RiskMetrics, RiskManagerState } from './types';
 
 export class RiskManager {
   private config: RiskConfig;
@@ -189,6 +189,66 @@ export class RiskManager {
 
   getConfig(): RiskConfig {
     return { ...this.config };
+  }
+
+  getState(): RiskManagerState {
+    return {
+      positions: this.getAllPositions().map((position) => ({ ...position })),
+      accountBalance: this.accountBalance,
+      realizedPnL: this.realizedPnL,
+      dailyRealizedPnL: this.dailyRealizedPnL,
+      peakEquity: this.peakEquity,
+      currentDay: this.currentDay,
+    };
+  }
+
+  restoreState(state: RiskManagerState): void {
+    this.positions = new Map(
+      state.positions.map((position) => [position.symbol, { ...position }])
+    );
+    this.accountBalance = this.ensureFinite(state.accountBalance, 'restored accountBalance');
+    this.realizedPnL = this.ensureFinite(state.realizedPnL, 'restored realizedPnL');
+    this.dailyRealizedPnL = this.ensureFinite(
+      state.dailyRealizedPnL,
+      'restored dailyRealizedPnL'
+    );
+    this.peakEquity = this.ensureFinite(state.peakEquity, 'restored peakEquity');
+    this.currentDay = state.currentDay || this.getDayKey(Date.now());
+    this.rollDayIfNeeded();
+
+    logger.info(
+      {
+        positionCount: this.positions.size,
+        accountBalance: this.accountBalance,
+        realizedPnL: this.realizedPnL,
+      },
+      'Risk manager restored from persisted state'
+    );
+  }
+
+  setAccountBalance(balance: number): void {
+    this.accountBalance = this.ensureFinite(balance, 'updated accountBalance');
+    this.updatePeakEquity();
+  }
+
+  upsertPosition(position: Position): void {
+    this.positions.set(position.symbol, {
+      ...position,
+      quantity: this.ensureFinite(position.quantity, `restored quantity for ${position.symbol}`),
+      entryPrice: this.ensureFinite(position.entryPrice, `restored entry price for ${position.symbol}`),
+      currentPrice: this.ensureFinite(position.currentPrice, `restored current price for ${position.symbol}`),
+      unrealizedPnL: this.ensureFinite(position.unrealizedPnL, `restored unrealized pnl for ${position.symbol}`),
+      unrealizedPnLPercent: this.ensureFinite(
+        position.unrealizedPnLPercent,
+        `restored unrealized pnl percent for ${position.symbol}`
+      ),
+    });
+    this.updatePeakEquity();
+  }
+
+  removePosition(symbol: string): void {
+    this.positions.delete(symbol);
+    this.updatePeakEquity();
   }
 
   calculatePositionSize(balance: number, stopDistance: number): number {

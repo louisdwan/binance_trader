@@ -3,44 +3,95 @@ import crypto from 'crypto';
 import logger from '../logger';
 import type { Order, ExecutionConfig, AccountBalance, AccountInfo } from './types';
 
+type ExchangeInfoSymbol = {
+  symbol: string;
+  status: string;
+  baseAsset: string;
+  quoteAsset: string;
+  filters: Array<Record<string, string>>;
+};
+
+type SymbolTradingRules = {
+  symbol: string;
+  status: string;
+  baseAsset: string;
+  quoteAsset: string;
+  minQty: number;
+  maxQty: number;
+  stepSize: number;
+  minNotional: number;
+  tickSize: number;
+};
+
+type PreparedOrder = Order & {
+  id: string;
+  timestamp: number;
+};
+
 export class OrderExecutor {
   private config: ExecutionConfig;
   private orders: Map<string, Order> = new Map();
   private orderCounter: number = 0;
+  private symbolRulesCache: Map<string, SymbolTradingRules> = new Map();
 
   constructor(config: ExecutionConfig) {
-    this.config = config;
+    this.config = {
+      recvWindow: config.recvWindow ?? 5000,
+      dryRun: config.dryRun ?? true,
+      ...config,
+    };
     logger.info(
-      { testnet: config.testnet },
+      {
+        testnet: this.config.testnet,
+        dryRun: this.config.dryRun,
+      },
       'OrderExecutor initialized'
     );
   }
 
   async executeOrder(order: Omit<Order, 'id' | 'timestamp'>): Promise<Order> {
-    const executedOrder: Order = {
+    const preparedOrder = await this.prepareOrder(order);
+    this.orders.set(preparedOrder.id, preparedOrder);
+
+    try {
+      let executedOrder: PreparedOrder;
+
+      if (this.config.dryRun) {
+        executedOrder = await this.simulateOrderExecution(preparedOrder);
+      } else {
+        executedOrder = await this.placeBinanceOrder(preparedOrder);
+      }
+
+      this.orders.set(executedOrder.id as string, executedOrder);
+      logger.info(
+        {
+          orderId: executedOrder.id,
+          symbol: executedOrder.symbol,
+          side: executedOrder.side,
+          type: executedOrder.type,
+          dryRun: this.config.dryRun,
+        },
+        'Order executed successfully'
+      );
+
+      return executedOrder;
+    } catch (error) {
+      preparedOrder.status = 'FAILED';
+      this.orders.set(preparedOrder.id, preparedOrder);
+      logger.error({ error, orderId: preparedOrder.id }, 'Order execution failed');
+      throw error;
+    }
+  }
+
+  async prepareOrder(order: Omit<Order, 'id' | 'timestamp'>): Promise<PreparedOrder> {
+    const executedOrder: PreparedOrder = {
       ...order,
       id: this.generateOrderId(),
       timestamp: Date.now(),
       status: order.status ?? 'PENDING',
     };
 
-    this.orders.set(executedOrder.id as string, executedOrder);
-
-    try {
-      // Simulate order execution
-      await this.simulateOrderExecution(executedOrder);
-
-      logger.info(
-        { orderId: executedOrder.id, symbol: order.symbol },
-        'Order executed successfully'
-      );
-
-      return executedOrder;
-    } catch (error) {
-      executedOrder.status = 'FAILED';
-      logger.error({ error, orderId: executedOrder.id }, 'Order execution failed');
-      throw error;
-    }
+    return this.normalizeOrder(executedOrder);
   }
 
   async cancelOrder(orderId: string): Promise<Order> {
@@ -72,6 +123,14 @@ export class OrderExecutor {
     return Array.from(this.orders.values());
   }
 
+  restoreOrders(orders: Order[]): void {
+    this.orders = new Map(
+      orders.map((order) => [String(order.id), { ...order }])
+    );
+    this.orderCounter = orders.length;
+    logger.info({ orderCount: orders.length }, 'Order executor restored from persisted state');
+  }
+
   getOpenOrders(): Order[] {
     return Array.from(this.orders.values()).filter(
       (order) => order.status === 'OPEN' || order.status === 'PENDING'
@@ -97,7 +156,7 @@ export class OrderExecutor {
     }
 
     const timestamp = Date.now();
-    const recvWindow = 5000;
+    const recvWindow = config.recvWindow ?? 5000;
     const query = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
     const signature = crypto
       .createHmac('sha256', config.apiSecret)
@@ -125,17 +184,278 @@ export class OrderExecutor {
     };
   }
 
-  private async simulateOrderExecution(order: Order): Promise<void> {
+  async getSymbolTradingRules(symbol: string): Promise<SymbolTradingRules> {
+    const normalizedSymbol = symbol.toUpperCase();
+    const cachedRules = this.symbolRulesCache.get(normalizedSymbol);
+    if (cachedRules) {
+      return cachedRules;
+    }
+
+    const baseURL = OrderExecutor.getBaseURL(this.config);
+    const response = await axios.get(`${baseURL}/exchangeInfo`, {
+      params: { symbol: normalizedSymbol },
+      timeout: 15000,
+    });
+
+    const exchangeSymbol = (response.data.symbols as ExchangeInfoSymbol[] | undefined)?.[0];
+    if (!exchangeSymbol) {
+      throw new Error(`No exchange rules found for symbol ${normalizedSymbol}`);
+    }
+
+    const lotSizeFilter = exchangeSymbol.filters.find(
+      (filter) => filter.filterType === 'LOT_SIZE'
+    );
+    const minNotionalFilter = exchangeSymbol.filters.find(
+      (filter) =>
+        filter.filterType === 'MIN_NOTIONAL' ||
+        filter.filterType === 'NOTIONAL'
+    );
+    const priceFilter = exchangeSymbol.filters.find(
+      (filter) => filter.filterType === 'PRICE_FILTER'
+    );
+
+    const rules: SymbolTradingRules = {
+      symbol: exchangeSymbol.symbol,
+      status: exchangeSymbol.status,
+      baseAsset: exchangeSymbol.baseAsset,
+      quoteAsset: exchangeSymbol.quoteAsset,
+      minQty: Number(lotSizeFilter?.minQty ?? 0),
+      maxQty: Number(lotSizeFilter?.maxQty ?? Number.MAX_SAFE_INTEGER),
+      stepSize: Number(lotSizeFilter?.stepSize ?? 0),
+      minNotional: Number(
+        minNotionalFilter?.minNotional ?? minNotionalFilter?.notional ?? 0
+      ),
+      tickSize: Number(priceFilter?.tickSize ?? 0),
+    };
+
+    this.symbolRulesCache.set(normalizedSymbol, rules);
+    return rules;
+  }
+
+  private async normalizeOrder(order: PreparedOrder): Promise<PreparedOrder> {
+    const rules = await this.getSymbolTradingRules(order.symbol);
+
+    if (rules.status !== 'TRADING') {
+      throw new Error(`Symbol ${order.symbol} is not tradable. Exchange status: ${rules.status}`);
+    }
+
+    const normalizedQuantity = this.normalizeQuantity(order.quantity, rules);
+    if (normalizedQuantity < rules.minQty) {
+      throw new Error(
+        `Order quantity ${normalizedQuantity} is below minQty ${rules.minQty} for ${order.symbol}`
+      );
+    }
+
+    if (normalizedQuantity > rules.maxQty) {
+      throw new Error(
+        `Order quantity ${normalizedQuantity} exceeds maxQty ${rules.maxQty} for ${order.symbol}`
+      );
+    }
+
+    const normalizedPrice =
+      order.price !== undefined ? this.normalizePrice(order.price, rules) : undefined;
+    const normalizedStopPrice =
+      order.stopPrice !== undefined
+        ? this.normalizePrice(order.stopPrice, rules)
+        : undefined;
+    const referencePrice = normalizedPrice ?? normalizedStopPrice;
+
+    if (rules.minNotional > 0 && referencePrice !== undefined) {
+      const notional = normalizedQuantity * referencePrice;
+      if (notional < rules.minNotional) {
+        throw new Error(
+          `Order notional ${notional} is below minNotional ${rules.minNotional} for ${order.symbol}`
+        );
+      }
+    }
+
+    return {
+      ...order,
+      symbol: rules.symbol,
+      quantity: normalizedQuantity,
+      price: normalizedPrice,
+      stopPrice: normalizedStopPrice,
+    };
+  }
+
+  private normalizeQuantity(quantity: number, rules: SymbolTradingRules): number {
+    const stepSize = rules.stepSize;
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error(`Invalid order quantity ${quantity} for ${rules.symbol}`);
+    }
+
+    if (stepSize <= 0) {
+      return quantity;
+    }
+
+    return this.floorToStep(quantity, stepSize);
+  }
+
+  private normalizePrice(price: number, rules: SymbolTradingRules): number {
+    const tickSize = rules.tickSize;
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error(`Invalid order price ${price} for ${rules.symbol}`);
+    }
+
+    if (tickSize <= 0) {
+      return price;
+    }
+
+    return this.floorToStep(price, tickSize);
+  }
+
+  private floorToStep(value: number, step: number): number {
+    const precision = this.getStepPrecision(step);
+    const scaledValue = Math.floor(value / step) * step;
+    return Number(scaledValue.toFixed(precision));
+  }
+
+  private getStepPrecision(step: number): number {
+    if (!Number.isFinite(step) || step <= 0) {
+      return 0;
+    }
+
+    const normalized = step.toString().toLowerCase();
+    if (normalized.includes('e-')) {
+      const exponent = normalized.split('e-')[1];
+      return Number(exponent);
+    }
+
+    const decimalPart = normalized.split('.')[1];
+    if (!decimalPart) {
+      return 0;
+    }
+
+    return decimalPart.replace(/0+$/, '').length;
+  }
+
+  private async simulateOrderExecution(order: PreparedOrder): Promise<PreparedOrder> {
     // Simulate a brief delay for order processing
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     if (order.status === 'CANCELLED') {
-      return;
+      return order;
     }
 
-    order.status = 'FILLED';
-    order.filledQuantity = order.quantity;
-    order.averagePrice = order.price;
+    return {
+      ...order,
+      status: 'FILLED',
+      filledQuantity: order.quantity,
+      averagePrice: order.price,
+    };
+  }
+
+  private async placeBinanceOrder(order: PreparedOrder): Promise<PreparedOrder> {
+    if (!this.config.apiKey || !this.config.apiSecret) {
+      throw new Error('Missing Binance API credentials');
+    }
+
+    const timestamp = Date.now();
+    const recvWindow = this.config.recvWindow ?? 5000;
+    const params = new URLSearchParams({
+      symbol: order.symbol,
+      side: order.side,
+      type: this.mapOrderType(order.type),
+      quantity: this.formatValue(order.quantity),
+      recvWindow: String(recvWindow),
+      timestamp: String(timestamp),
+    });
+
+    if (order.price !== undefined && order.type !== 'MARKET') {
+      params.set('price', this.formatValue(order.price));
+    }
+
+    if (order.stopPrice !== undefined) {
+      params.set('stopPrice', this.formatValue(order.stopPrice));
+    }
+
+    if (order.type !== 'MARKET' && order.type !== 'STOP_LOSS') {
+      params.set('timeInForce', 'GTC');
+    }
+
+    const signature = crypto
+      .createHmac('sha256', this.config.apiSecret)
+      .update(params.toString())
+      .digest('hex');
+    params.set('signature', signature);
+
+    const baseURL = OrderExecutor.getBaseURL(this.config);
+    const response = await axios.post(`${baseURL}/order`, params.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-MBX-APIKEY': this.config.apiKey,
+      },
+      timeout: 15000,
+    });
+
+    return {
+      ...order,
+      id: String(response.data.orderId ?? order.id),
+      timestamp: Number(response.data.transactTime ?? timestamp),
+      status: this.mapBinanceOrderStatus(response.data.status),
+      quantity: Number(response.data.origQty ?? order.quantity),
+      filledQuantity: Number(response.data.executedQty ?? 0),
+      averagePrice: this.extractAveragePrice(response.data, order),
+    };
+  }
+
+  private mapOrderType(type: Order['type']): string {
+    switch (type) {
+      case 'MARKET':
+        return 'MARKET';
+      case 'LIMIT':
+        return 'LIMIT';
+      case 'STOP_LOSS':
+        return 'STOP_LOSS';
+      case 'TAKE_PROFIT':
+        return 'TAKE_PROFIT';
+      default:
+        throw new Error(`Unsupported Binance order type ${type}`);
+    }
+  }
+
+  private mapBinanceOrderStatus(status: string | undefined): Order['status'] {
+    switch (status) {
+      case 'NEW':
+      case 'PARTIALLY_FILLED':
+        return 'OPEN';
+      case 'FILLED':
+        return 'FILLED';
+      case 'CANCELED':
+      case 'EXPIRED':
+      case 'REJECTED':
+        return 'CANCELLED';
+      default:
+        return 'PENDING';
+    }
+  }
+
+  private extractAveragePrice(responseData: any, order: PreparedOrder): number | undefined {
+    const executedQty = Number(responseData.executedQty ?? 0);
+    const cumulativeQuoteQty = Number(responseData.cummulativeQuoteQty ?? 0);
+
+    if (executedQty > 0 && cumulativeQuoteQty > 0) {
+      return cumulativeQuoteQty / executedQty;
+    }
+
+    const fills = responseData.fills as Array<{ price: string; qty: string }> | undefined;
+    if (fills && fills.length > 0) {
+      const totalQty = fills.reduce((sum, fill) => sum + Number(fill.qty), 0);
+      const totalNotional = fills.reduce(
+        (sum, fill) => sum + Number(fill.price) * Number(fill.qty),
+        0
+      );
+
+      if (totalQty > 0) {
+        return totalNotional / totalQty;
+      }
+    }
+
+    return order.price;
+  }
+
+  private formatValue(value: number): string {
+    return value.toFixed(16).replace(/\.?0+$/, '');
   }
 
   private generateOrderId(): string {

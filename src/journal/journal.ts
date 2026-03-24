@@ -83,6 +83,13 @@ export class TradeJournal {
     return [...this.trades];
   }
 
+  restoreTrades(trades: TradeEntry[]): void {
+    this.trades = trades.map((trade) => ({ ...trade }));
+    this.tradeMap = new Map(this.trades.map((trade) => [trade.id, trade]));
+
+    logger.info({ tradeCount: this.trades.length }, 'Trade journal restored from persisted state');
+  }
+
   getTradesBySymbol(symbol: string): TradeEntry[] {
     return this.trades.filter((trade) => trade.symbol === symbol);
   }

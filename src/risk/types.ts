@@ -31,3 +31,12 @@ export interface RiskMetrics {
   drawdown: number;
   drawdownPercent: number;
 }
+
+export interface RiskManagerState {
+  positions: Position[];
+  accountBalance: number;
+  realizedPnL: number;
+  dailyRealizedPnL: number;
+  peakEquity: number;
+  currentDay: string;
+}
