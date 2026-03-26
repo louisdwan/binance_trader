@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { type AxiosResponse } from 'axios';
 import crypto from 'crypto';
 import logger from '../logger';
 import type { Order, ExecutionConfig, AccountBalance, AccountInfo } from './types';
@@ -28,7 +28,19 @@ type PreparedOrder = Order & {
   timestamp: number;
 };
 
+type BinanceErrorPayload = {
+  code?: number;
+  msg?: string;
+};
+
+type ServerTimeOffset = {
+  offsetMs: number;
+  syncedAt: number;
+};
+
 export class OrderExecutor {
+  private static readonly serverTimeCacheTtlMs = 60_000;
+  private static readonly serverTimeOffsets = new Map<string, ServerTimeOffset>();
   private config: ExecutionConfig;
   private orders: Map<string, Order> = new Map();
   private orderCounter: number = 0;
@@ -155,20 +167,9 @@ export class OrderExecutor {
       throw new Error('Missing Binance API credentials');
     }
 
-    const timestamp = Date.now();
     const recvWindow = config.recvWindow ?? 5000;
-    const query = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
-    const signature = crypto
-      .createHmac('sha256', config.apiSecret)
-      .update(query)
-      .digest('hex');
-
-    const baseURL = OrderExecutor.getBaseURL(config);
-    const url = `${baseURL}/account?${query}&signature=${signature}`;
-
-    const response = await axios.get(url, {
-      headers: { 'X-MBX-APIKEY': config.apiKey },
-      timeout: 15000,
+    const response = await OrderExecutor.sendSignedRequest<any>(config, 'GET', '/account', {
+      recvWindow: String(recvWindow),
     });
 
     return {
@@ -350,7 +351,6 @@ export class OrderExecutor {
       throw new Error('Missing Binance API credentials');
     }
 
-    const timestamp = Date.now();
     const recvWindow = this.config.recvWindow ?? 5000;
     const params = new URLSearchParams({
       symbol: order.symbol,
@@ -358,7 +358,6 @@ export class OrderExecutor {
       type: this.mapOrderType(order.type),
       quantity: this.formatValue(order.quantity),
       recvWindow: String(recvWindow),
-      timestamp: String(timestamp),
     });
 
     if (order.price !== undefined && order.type !== 'MARKET') {
@@ -373,25 +372,18 @@ export class OrderExecutor {
       params.set('timeInForce', 'GTC');
     }
 
-    const signature = crypto
-      .createHmac('sha256', this.config.apiSecret)
-      .update(params.toString())
-      .digest('hex');
-    params.set('signature', signature);
-
-    const baseURL = OrderExecutor.getBaseURL(this.config);
-    const response = await axios.post(`${baseURL}/order`, params.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'X-MBX-APIKEY': this.config.apiKey,
-      },
-      timeout: 15000,
-    });
+    const response = await OrderExecutor.sendSignedRequest<any>(
+      this.config,
+      'POST',
+      '/order',
+      params
+    );
+    const requestTimestamp = Number(response.config.params?.timestamp ?? Date.now());
 
     return {
       ...order,
       id: String(response.data.orderId ?? order.id),
-      timestamp: Number(response.data.transactTime ?? timestamp),
+      timestamp: Number(response.data.transactTime ?? requestTimestamp),
       status: this.mapBinanceOrderStatus(response.data.status),
       quantity: Number(response.data.origQty ?? order.quantity),
       filledQuantity: Number(response.data.executedQty ?? 0),
@@ -470,5 +462,99 @@ export class OrderExecutor {
     return config.testnet
       ? 'https://testnet.binance.vision/api/v3'
       : 'https://api.binance.com/api/v3';
+  }
+
+  private static async sendSignedRequest<T>(
+    config: ExecutionConfig,
+    method: 'GET' | 'POST',
+    path: string,
+    params: URLSearchParams | Record<string, string>,
+    allowRetry: boolean = true
+  ): Promise<AxiosResponse<T>> {
+    const baseURL = OrderExecutor.getBaseURL(config);
+    const paramsWithTimestamp =
+      params instanceof URLSearchParams ? new URLSearchParams(params) : new URLSearchParams(params);
+
+    paramsWithTimestamp.set(
+      'timestamp',
+      String(await OrderExecutor.getTimestamp(baseURL, config, false))
+    );
+
+    const signature = crypto
+      .createHmac('sha256', config.apiSecret)
+      .update(paramsWithTimestamp.toString())
+      .digest('hex');
+    paramsWithTimestamp.set('signature', signature);
+
+    try {
+      if (method === 'GET') {
+        return await axios.get<T>(`${baseURL}${path}`, {
+          headers: { 'X-MBX-APIKEY': config.apiKey },
+          params: Object.fromEntries(paramsWithTimestamp.entries()),
+          timeout: 15000,
+        });
+      }
+
+      return await axios.post<T>(`${baseURL}${path}`, paramsWithTimestamp.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-MBX-APIKEY': config.apiKey,
+        },
+        params: { timestamp: paramsWithTimestamp.get('timestamp') },
+        timeout: 15000,
+      });
+    } catch (error) {
+      const binanceError = OrderExecutor.getBinanceErrorPayload(error);
+      if (allowRetry && binanceError?.code === -1021) {
+        await OrderExecutor.getTimestamp(baseURL, config, true);
+        return OrderExecutor.sendSignedRequest<T>(config, method, path, params, false);
+      }
+
+      throw error;
+    }
+  }
+
+  private static async getTimestamp(
+    baseURL: string,
+    config: ExecutionConfig,
+    forceRefresh: boolean
+  ): Promise<number> {
+    const now = Date.now();
+    const cachedOffset = OrderExecutor.serverTimeOffsets.get(baseURL);
+    if (
+      !forceRefresh &&
+      cachedOffset &&
+      now - cachedOffset.syncedAt < OrderExecutor.serverTimeCacheTtlMs
+    ) {
+      return now + cachedOffset.offsetMs;
+    }
+
+    const response = await axios.get<{ serverTime: number }>(`${baseURL}/time`, {
+      timeout: 15000,
+    });
+    const syncedAt = Date.now();
+    const offsetMs = response.data.serverTime - syncedAt;
+
+    OrderExecutor.serverTimeOffsets.set(baseURL, {
+      offsetMs,
+      syncedAt,
+    });
+
+    logger.info({ baseURL, offsetMs }, 'Synchronized Binance server time offset');
+
+    return syncedAt + offsetMs;
+  }
+
+  private static getBinanceErrorPayload(error: unknown): BinanceErrorPayload | null {
+    if (!axios.isAxiosError(error) || !error.response?.data) {
+      return null;
+    }
+
+    const data = error.response.data as BinanceErrorPayload;
+    if (typeof data !== 'object' || data === null) {
+      return null;
+    }
+
+    return data;
   }
 }
