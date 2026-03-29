@@ -50,6 +50,12 @@ export class TrendPullbackStrategy extends BaseStrategy {
         action: 'HOLD',
         confidence: 0,
         reasoning: 'Insufficient data for trend pullback analysis',
+        diagnostics: {
+          enough1mCandles: this.candles.length >= this.pullbackPeriod,
+          enough15mCandles: higherTimeframeCandles.length >= this.trendPeriod + 1,
+          candleCount1m: this.candles.length,
+          candleCount15m: higherTimeframeCandles.length,
+        },
       };
     }
 
@@ -71,6 +77,12 @@ export class TrendPullbackStrategy extends BaseStrategy {
         action: 'HOLD',
         confidence: 0,
         reasoning: 'Unable to calculate EMA inputs',
+        diagnostics: {
+          emaFast,
+          emaPullback,
+          trendEma,
+          previousTrendEma,
+        },
       };
     }
 
@@ -104,6 +116,27 @@ export class TrendPullbackStrategy extends BaseStrategy {
     const closedBackAbovePullback = currentPrice >= emaPullback;
     const pullbackIsTight =
       pullbackDistancePercent <= this.pullbackTolerancePercent * 1.5;
+    const diagnostics = {
+      emaFast,
+      emaPullback,
+      trendEma,
+      previousTrendEma,
+      currentPrice,
+      higherTimeframePrice,
+      trendStrengthPercent,
+      pullbackDistancePercent,
+      trendUp,
+      trendDown,
+      fastAbovePullback: emaFast > emaPullback,
+      touchedPullbackZone,
+      pulledBelowFast,
+      resumedUp,
+      closedBackAbovePullback,
+      pullbackIsTight,
+      trendBufferPercent: this.trendBufferPercent,
+      minTrendStrengthPercent: this.minTrendStrengthPercent,
+      pullbackTolerancePercent: this.pullbackTolerancePercent,
+    };
 
     if (
       trendUp &&
@@ -134,6 +167,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
         reasoning:
           `15m trend is up above EMA${this.trendPeriod}, and 1m price pulled back ` +
           `toward EMA${this.pullbackPeriod} before reclaiming EMA${this.fastPeriod} with bullish follow-through`,
+        diagnostics,
       };
 
       this.logAnalysis(signal);
@@ -150,6 +184,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
         reasoning:
           `15m trend is below EMA${this.trendPeriod} by more than ` +
           `${this.trendBufferPercent}% with a weakening EMA slope`,
+        diagnostics,
       };
 
       this.logAnalysis(signal);
@@ -163,6 +198,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
         trendUp
           ? 'Trend is up, but the 1m pullback entry is not ready'
           : `15m trend is inside the neutral zone around EMA${this.trendPeriod}`,
+      diagnostics,
     };
 
     this.logAnalysis(signal);

@@ -217,10 +217,20 @@ class TradingSystem {
       logger.info({ signal }, 'Strategy signal generated');
       const atr = this.calculateATR(candles, 14);
       const atrPercent = ticker.price > 0 ? (atr / ticker.price) * 100 : 0;
+      const existingPosition = this.riskManager.getPosition(this.symbol);
+      const entryContext = {
+        symbol: this.symbol,
+        price: ticker.price,
+        atr,
+        atrPercent,
+        minAtrPercentForEntry: this.minAtrPercentForEntry,
+        entrySignalThreshold: this.entrySignalThreshold,
+        existingPosition: Boolean(existingPosition),
+        diagnostics: signal.diagnostics,
+      };
 
       this.logRiskMetrics('Risk metrics before trade evaluation');
 
-      const existingPosition = this.riskManager.getPosition(this.symbol);
       if (existingPosition) {
         this.riskManager.updatePositionPrice(this.symbol, ticker.price);
 
@@ -242,15 +252,10 @@ class TradingSystem {
       // Order execution (simulated)
       if (signal.action === 'BUY' && signal.confidence >= this.entrySignalThreshold) {
         if (!this.riskManager.validateRisk()) {
-          logger.warn('Skipping BUY because portfolio risk limits are exceeded');
+          logger.warn(entryContext, 'Skipping BUY because portfolio risk limits are exceeded');
         } else if (atrPercent < this.minAtrPercentForEntry) {
           logger.info(
-            {
-              symbol: this.symbol,
-              atr,
-              atrPercent,
-              minAtrPercentForEntry: this.minAtrPercentForEntry,
-            },
+            entryContext,
             'Skipping BUY because volatility is too low for the pullback setup'
           );
         } else if (!existingPosition) {
@@ -315,13 +320,17 @@ class TradingSystem {
           }
         } else {
           logger.info(
-            { symbol: this.symbol },
+            entryContext,
             'Skipping BUY because a position is already open'
           );
         }
       } else {
         logger.info(
-          { action: signal.action, confidence: signal.confidence, threshold: this.entrySignalThreshold },
+          {
+            ...entryContext,
+            action: signal.action,
+            confidence: signal.confidence,
+          },
           'No entry executed this cycle'
         );
       }
