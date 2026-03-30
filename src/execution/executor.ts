@@ -91,7 +91,14 @@ export class OrderExecutor {
     } catch (error) {
       preparedOrder.status = 'FAILED';
       this.orders.set(preparedOrder.id, preparedOrder);
-      logger.error({ error, orderId: preparedOrder.id }, 'Order execution failed');
+      logger.error(
+        {
+          error,
+          orderId: preparedOrder.id,
+          binanceError: OrderExecutor.getBinanceErrorPayload(error),
+        },
+        'Order execution failed'
+      );
       throw error;
     }
   }
@@ -505,7 +512,6 @@ export class OrderExecutor {
           'Content-Type': 'application/x-www-form-urlencoded',
           'X-MBX-APIKEY': config.apiKey,
         },
-        params: { timestamp: paramsWithTimestamp.get('timestamp') },
         timeout: 15000,
       });
     } catch (error) {
