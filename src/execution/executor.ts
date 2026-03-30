@@ -40,6 +40,7 @@ type ServerTimeOffset = {
 
 export class OrderExecutor {
   private static readonly serverTimeCacheTtlMs = 60_000;
+  private static readonly pendingOrderStaleAfterMs = 5 * 60 * 1000;
   private static readonly serverTimeOffsets = new Map<string, ServerTimeOffset>();
   private config: ExecutionConfig;
   private orders: Map<string, Order> = new Map();
@@ -144,8 +145,12 @@ export class OrderExecutor {
   }
 
   getOpenOrders(): Order[] {
+    const now = Date.now();
     return Array.from(this.orders.values()).filter(
-      (order) => order.status === 'OPEN' || order.status === 'PENDING'
+      (order) =>
+        order.status === 'OPEN' ||
+        (order.status === 'PENDING' &&
+          now - order.timestamp <= OrderExecutor.pendingOrderStaleAfterMs)
     );
   }
 

@@ -1031,16 +1031,16 @@ class ControlServer {
     res: ServerResponse
   ): Promise<void> {
     try {
-      if (!this.isAuthorized(req)) {
-        this.sendJson(res, 401, { error: 'Unauthorized' });
-        return;
-      }
-
       const method = req.method || 'GET';
       const url = new URL(req.url || '/', 'http://localhost');
 
       if (method === 'GET' && url.pathname === '/health') {
         this.sendJson(res, 200, { ok: true, status: this.system.getStatus() });
+        return;
+      }
+
+      if (!this.isAuthorized(req)) {
+        this.sendJson(res, 401, { error: 'Unauthorized' });
         return;
       }
 
