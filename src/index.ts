@@ -721,11 +721,35 @@ class TradingSystem {
       return;
     }
 
+    const baseAsset = this.baseAssets[symbol];
+    const baseAssetBalance = baseAsset
+      ? await this.orderExecutor.getAssetBalance(baseAsset)
+      : null;
+    const freeBaseQuantity = Math.max(baseAssetBalance?.free ?? 0, 0);
+    const exitQuantity =
+      freeBaseQuantity > 0
+        ? Math.min(position.quantity, freeBaseQuantity)
+        : position.quantity;
+
+    if (exitQuantity <= 0) {
+      logger.warn(
+        {
+          symbol,
+          baseAsset,
+          positionQuantity: position.quantity,
+          freeBaseQuantity,
+          reason,
+        },
+        'Skipping exit because no free base-asset balance is available'
+      );
+      return;
+    }
+
     const order = await this.orderExecutor.executeOrder({
       symbol,
       side: 'SELL',
       type: 'MARKET',
-      quantity: position.quantity,
+      quantity: exitQuantity,
       price: currentPrice,
       status: 'PENDING',
     });
