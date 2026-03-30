@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import fs from 'fs/promises';
 import http, { type IncomingMessage, type ServerResponse } from 'http';
 import path from 'path';
 import logger from './logger';
@@ -9,7 +10,11 @@ import {
 } from './marketData';
 import {
   TrendPullbackStrategy,
+  BreakoutConfirmationStrategy,
+  MeanReversionDipBuyStrategy,
+  BaseStrategy,
   type StrategyConfig,
+  type StrategySignal,
 } from './strategy';
 import {
   OrderExecutor,
@@ -22,6 +27,7 @@ import { TradeJournal } from './journal';
 import {
   FileStateStore,
   type PersistedTradingState,
+  type LegacyPersistedTradingState,
 } from './runtime/stateStore';
 
 type BinanceEnvironment = 'testnet' | 'live';
@@ -29,6 +35,7 @@ type SystemState = 'idle' | 'running' | 'paused' | 'stopping';
 
 type TradingSystemStatus = {
   symbol: string;
+  symbols: string[];
   state: SystemState;
   isCycleRunning: boolean;
   cycleIntervalMs: number | null;
@@ -37,6 +44,7 @@ type TradingSystemStatus = {
   lastCycleError: string | null;
   entrySignalThreshold: number;
   openPosition: ReturnType<RiskManager['getPosition']>;
+  openPositions: ReturnType<RiskManager['getAllPositions']>;
   riskMetrics: ReturnType<RiskManager['getRiskMetrics']>;
   journalStats: ReturnType<TradeJournal['calculateStats']>;
   openOrders: ReturnType<OrderExecutor['getOpenOrders']>;
@@ -51,19 +59,48 @@ type ControlServerConfig = {
 
 type TradingSystemOptions = {
   quoteAsset: string;
-  baseAsset: string;
+  baseAssets: Record<string, string>;
   stateStore: FileStateStore;
   liveMaxOrderNotional?: number;
+  strategyTemplates: StrategyTemplateConfig[];
 };
 
-function getTradingSymbol(): string {
-  const symbol = (process.env.TRADING_SYMBOL || 'BTCUSDT').toUpperCase();
+type RankedStrategyCandidate = StrategySignal & {
+  rankScore: number;
+};
 
-  if (!/^[A-Z0-9]+$/.test(symbol)) {
-    throw new Error(`Invalid TRADING_SYMBOL value "${symbol}"`);
+type StrategyTemplateConfig = {
+  type: StrategyConfig['type'];
+  name: string;
+  enabled: boolean;
+  parameters: Record<string, unknown>;
+};
+
+type BotConfig = {
+  symbols: string[];
+  strategies: StrategyTemplateConfig[];
+};
+
+type SymbolRuntimeContext = {
+  symbol: string;
+  ticker: Ticker;
+  candles: CandleData[];
+  higherTimeframeCandles: CandleData[];
+  atr: number;
+  atrPercent: number;
+  selectedBuySignal: RankedStrategyCandidate | null;
+  selectedSellSignal: RankedStrategyCandidate | null;
+  strategySignals: StrategySignal[];
+};
+
+function normalizeSymbol(symbol: string): string {
+  const normalized = symbol.trim().toUpperCase();
+
+  if (!/^[A-Z0-9]+$/.test(normalized)) {
+    throw new Error(`Invalid trading symbol value "${symbol}"`);
   }
 
-  return symbol;
+  return normalized;
 }
 
 function getQuoteAsset(symbol: string): string {
@@ -105,15 +142,118 @@ function getBaseAsset(symbol: string): string {
   return baseAsset;
 }
 
+function getConfigFilePath(): string {
+  const rawValue = process.env.BOT_CONFIG_FILE?.trim();
+  return rawValue ? path.resolve(rawValue) : path.resolve(process.cwd(), 'config', 'trading.json');
+}
+
+function getDefaultBotConfig(): BotConfig {
+  return {
+    symbols: [normalizeSymbol(process.env.TRADING_SYMBOL || 'BTCUSDT')],
+    strategies: [
+      {
+        type: 'trend_pullback',
+        name: 'Trend Pullback Strategy',
+        enabled: true,
+        parameters: {
+          fastPeriod: 5,
+          pullbackPeriod: 20,
+          trendPeriod: 200,
+          pullbackTolerancePercent: 0.15,
+          trendBufferPercent: 0.35,
+          minTrendStrengthPercent: 0.03,
+        },
+      },
+      {
+        type: 'breakout_confirmation',
+        name: 'Breakout Confirmation Strategy',
+        enabled: true,
+        parameters: {
+          breakoutLookback: 20,
+          volumeLookback: 20,
+          breakoutBufferPercent: 0.05,
+          volumeMultiplier: 1.2,
+          trendPeriod: 200,
+        },
+      },
+      {
+        type: 'mean_reversion_dip_buy',
+        name: 'Mean Reversion Dip Buy Strategy',
+        enabled: true,
+        parameters: {
+          bandPeriod: 20,
+          bandStdDevMultiplier: 2,
+          trendPeriod: 200,
+          reclaimPercent: 0.05,
+        },
+      },
+    ],
+  };
+}
+
+async function loadBotConfig(): Promise<BotConfig> {
+  const configFilePath = getConfigFilePath();
+
+  try {
+    const raw = await fs.readFile(configFilePath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<BotConfig>;
+    const symbols = (parsed.symbols ?? []).map((symbol) => normalizeSymbol(String(symbol)));
+    const strategies = (parsed.strategies ?? []).map((strategy, index) => {
+      const typedStrategy = strategy as Partial<StrategyTemplateConfig>;
+      if (
+        typedStrategy.type !== 'trend_pullback' &&
+        typedStrategy.type !== 'breakout_confirmation' &&
+        typedStrategy.type !== 'mean_reversion_dip_buy'
+      ) {
+        throw new Error(`Invalid strategy type at index ${index}`);
+      }
+
+      return {
+        type: typedStrategy.type,
+        name: typedStrategy.name?.trim() || typedStrategy.type,
+        enabled: typedStrategy.enabled ?? true,
+        parameters: (typedStrategy.parameters as Record<string, unknown> | undefined) ?? {},
+      };
+    });
+
+    if (symbols.length === 0) {
+      throw new Error('Config must include at least one symbol');
+    }
+
+    if (strategies.length === 0) {
+      throw new Error('Config must include at least one strategy');
+    }
+
+    return { symbols, strategies };
+  } catch (error: unknown) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as NodeJS.ErrnoException).code === 'ENOENT'
+    ) {
+      const defaultConfig = getDefaultBotConfig();
+      const configFilePath = getConfigFilePath();
+      await fs.mkdir(path.dirname(configFilePath), { recursive: true });
+      await fs.writeFile(configFilePath, JSON.stringify(defaultConfig, null, 2), 'utf8');
+      logger.warn({ configFilePath }, 'Bot config file not found; wrote default config');
+      return defaultConfig;
+    }
+
+    throw error;
+  }
+}
+
 class TradingSystem {
   private marketDataProvider: MarketDataProvider;
   private orderExecutor: OrderExecutor;
   private riskManager: RiskManager;
   private journal: TradeJournal;
   private openTrades: Map<string, { tradeId: string; entryAtr: number }> = new Map();
-  private readonly symbol: string;
+  private readonly symbols: string[];
   private readonly quoteAsset: string;
-  private readonly baseAsset: string;
+  private readonly baseAssets: Record<string, string>;
+  private readonly strategyTemplates: StrategyTemplateConfig[];
   private readonly stateStore: FileStateStore;
   private readonly liveMaxOrderNotional?: number;
   private readonly entrySignalThreshold: number = 0.25;
@@ -135,23 +275,25 @@ class TradingSystem {
     executionConfig: ExecutionConfig,
     riskConfig: RiskConfig,
     initialBalance: number,
-    symbol: string,
+    symbols: string[],
     options: TradingSystemOptions
   ) {
     this.marketDataProvider = marketDataProvider;
     this.orderExecutor = new OrderExecutor(executionConfig);
     this.riskManager = new RiskManager(riskConfig, initialBalance);
     this.journal = new TradeJournal();
-    this.symbol = symbol;
+    this.symbols = symbols;
     this.quoteAsset = options.quoteAsset;
-    this.baseAsset = options.baseAsset;
+    this.baseAssets = options.baseAssets;
+    this.strategyTemplates = options.strategyTemplates;
     this.stateStore = options.stateStore;
     this.liveMaxOrderNotional = options.liveMaxOrderNotional;
     this.dryRun = executionConfig.dryRun;
 
     logger.info(
       {
-        symbol,
+        symbols: this.symbols,
+        quoteAsset: this.quoteAsset,
         stateFile: this.stateStore.getFilePath(),
         liveMaxOrderNotional: this.liveMaxOrderNotional,
       },
@@ -161,187 +303,209 @@ class TradingSystem {
 
   async runCycle(): Promise<void> {
     if (this.state === 'paused') {
-      logger.info({ symbol: this.symbol }, 'Skipping cycle because trading is paused');
+      logger.info({ symbols: this.symbols }, 'Skipping cycle because trading is paused');
       return;
     }
 
     try {
-      // Fetch market data
-      const ticker: Ticker = await this.marketDataProvider.getTicker(
-        this.symbol
-      );
-      logger.info(
-        { ticker },
-        'Market data fetched successfully'
-      );
-
-      // Get candle data for strategy analysis
-      const candles: CandleData[] = await this.marketDataProvider.getCandles(
-        this.symbol,
-        '1m',
-        100
-      );
-      const higherTimeframeCandles: CandleData[] =
-        await this.marketDataProvider.getCandles(
-          this.symbol,
-          '15m',
-          240
-      );
-      logger.info(
-        {
-          candleCount: candles.length,
-          higherTimeframeCandleCount: higherTimeframeCandles.length,
-        },
-        'Candle data retrieved'
-      );
-
-      // Create and run strategy
-      const strategyConfig: StrategyConfig = {
-        name: 'Trend Pullback Strategy',
-        symbol: this.symbol,
-        enabled: true,
-        parameters: {
-          fastPeriod: 5,
-          pullbackPeriod: 20,
-          trendPeriod: 200,
-          pullbackTolerancePercent: 0.15,
-          trendBufferPercent: 0.35,
-          minTrendStrengthPercent: 0.03,
-          higherTimeframeCandles,
-        },
-      };
-
-      const strategy = new TrendPullbackStrategy(strategyConfig);
-      strategy.updateCandles(candles);
-      const signal = strategy.analyze();
-      logger.info({ signal }, 'Strategy signal generated');
-      const atr = this.calculateATR(candles, 14);
-      const atrPercent = ticker.price > 0 ? (atr / ticker.price) * 100 : 0;
-      const existingPosition = this.riskManager.getPosition(this.symbol);
-      const entryContext = {
-        symbol: this.symbol,
-        price: ticker.price,
-        atr,
-        atrPercent,
-        minAtrPercentForEntry: this.minAtrPercentForEntry,
-        entrySignalThreshold: this.entrySignalThreshold,
-        existingPosition: Boolean(existingPosition),
-        diagnostics: signal.diagnostics,
-      };
-
       this.logRiskMetrics('Risk metrics before trade evaluation');
-
-      if (existingPosition) {
-        this.riskManager.updatePositionPrice(this.symbol, ticker.price);
-
-        const exitReason = this.getExitReason(
-          existingPosition.entryPrice,
-          ticker.price,
-          signal.action
-        );
-
-        if (exitReason) {
-          await this.closePosition(ticker.price, exitReason);
-          this.logRiskMetrics('Risk metrics after closing position');
-          const stats = this.journal.calculateStats();
-          logger.info({ stats }, 'Trading cycle completed');
-          return;
-        }
+      for (const symbol of this.symbols) {
+        const context = await this.evaluateSymbol(symbol);
+        await this.processSymbolContext(context);
       }
 
-      // Order execution (simulated)
-      if (signal.action === 'BUY' && signal.confidence >= this.entrySignalThreshold) {
-        if (!this.riskManager.validateRisk()) {
-          logger.warn(entryContext, 'Skipping BUY because portfolio risk limits are exceeded');
-        } else if (atrPercent < this.minAtrPercentForEntry) {
-          logger.info(
-            entryContext,
-            'Skipping BUY because volatility is too low for the pullback setup'
-          );
-        } else if (!existingPosition) {
-          const rawQuantity = this.calculateOrderQuantity(
-            ticker.price,
-            atr * this.stopLossAtrMultiple
-          );
-          const preparedOrder = await this.orderExecutor.prepareOrder({
-            symbol: this.symbol,
-            side: 'BUY',
-            type: 'MARKET',
-            quantity: rawQuantity,
-            price: ticker.price,
-            status: 'PENDING',
-          });
-
-          if (!this.riskManager.canOpenPosition(preparedOrder.quantity, ticker.price)) {
-            logger.warn(
-              {
-                symbol: this.symbol,
-                quantity: preparedOrder.quantity,
-                requestedQuantity: rawQuantity,
-                price: ticker.price,
-              },
-              'Skipping BUY because position would exceed exposure limits'
-            );
-          } else {
-            const order = await this.orderExecutor.executeOrder({
-              symbol: preparedOrder.symbol,
-              side: preparedOrder.side,
-              type: preparedOrder.type,
-              quantity: preparedOrder.quantity,
-              price: preparedOrder.price,
-              stopPrice: preparedOrder.stopPrice,
-              status: preparedOrder.status,
-            });
-
-            logger.info({ order }, 'Order executed');
-            this.riskManager.openPosition(
-              order.symbol,
-              order.quantity,
-              order.averagePrice ?? ticker.price
-            );
-
-            this.journal.recordEntry({
-              id: order.id!,
-              symbol: this.symbol,
-              entryTime: order.timestamp,
-              entryPrice: order.averagePrice ?? ticker.price,
-              quantity: order.quantity,
-              side: 'BUY',
-              strategyName: strategy.getName(),
-              reason: signal.reasoning,
-              notes: `Confidence: ${signal.confidence.toFixed(2)}`,
-            });
-            this.openTrades.set(this.symbol, {
-              tradeId: order.id!,
-              entryAtr: atr,
-            });
-            await this.persistState('position opened');
-            this.logRiskMetrics('Risk metrics after opening position');
-          }
-        } else {
-          logger.info(
-            entryContext,
-            'Skipping BUY because a position is already open'
-          );
-        }
-      } else {
-        logger.info(
-          {
-            ...entryContext,
-            action: signal.action,
-            confidence: signal.confidence,
-          },
-          'No entry executed this cycle'
-        );
-      }
-
-      // Display journal stats
       const stats = this.journal.calculateStats();
       logger.info({ stats }, 'Trading cycle completed');
     } catch (error) {
       logger.error({ error }, 'Error in trading cycle');
       throw error;
     }
+  }
+
+  private async evaluateSymbol(symbol: string): Promise<SymbolRuntimeContext> {
+    const ticker = await this.marketDataProvider.getTicker(symbol);
+    logger.info({ ticker }, 'Market data fetched successfully');
+
+    const candles = await this.marketDataProvider.getCandles(symbol, '1m', 100);
+    const higherTimeframeCandles = await this.marketDataProvider.getCandles(symbol, '15m', 240);
+    logger.info(
+      {
+        symbol,
+        candleCount: candles.length,
+        higherTimeframeCandleCount: higherTimeframeCandles.length,
+      },
+      'Candle data retrieved'
+    );
+
+    const strategies = this.buildStrategies(symbol, higherTimeframeCandles);
+    const strategySignals = strategies.map((strategy) => {
+      strategy.updateCandles(candles);
+      return strategy.analyze();
+    });
+    const selectedBuySignal = this.selectBestCandidate(
+      strategySignals.filter((signal) => signal.action === 'BUY')
+    );
+    const selectedSellSignal = this.selectBestCandidate(
+      strategySignals.filter((signal) => signal.action === 'SELL')
+    );
+    logger.info(
+      {
+        symbol,
+        strategySignals: strategySignals.map((signal) => ({
+          strategyName: signal.strategyName,
+          action: signal.action,
+          confidence: signal.confidence,
+          reasoning: signal.reasoning,
+        })),
+        selectedBuySignal,
+        selectedSellSignal,
+      },
+      'Strategy scan completed'
+    );
+
+    const atr = this.calculateATR(candles, 14);
+    const atrPercent = ticker.price > 0 ? (atr / ticker.price) * 100 : 0;
+
+    return {
+      symbol,
+      ticker,
+      candles,
+      higherTimeframeCandles,
+      atr,
+      atrPercent,
+      selectedBuySignal,
+      selectedSellSignal,
+      strategySignals,
+    };
+  }
+
+  private async processSymbolContext(context: SymbolRuntimeContext): Promise<void> {
+    const existingPosition = this.riskManager.getPosition(context.symbol);
+    const entryContext = {
+      symbol: context.symbol,
+      price: context.ticker.price,
+      atr: context.atr,
+      atrPercent: context.atrPercent,
+      minAtrPercentForEntry: this.minAtrPercentForEntry,
+      entrySignalThreshold: this.entrySignalThreshold,
+      existingPosition: Boolean(existingPosition),
+      selectedBuySignal: context.selectedBuySignal,
+      selectedSellSignal: context.selectedSellSignal,
+    };
+
+    if (existingPosition) {
+      this.riskManager.updatePositionPrice(context.symbol, context.ticker.price);
+
+      const exitReason = this.getExitReason(
+        context.symbol,
+        existingPosition.entryPrice,
+        context.ticker.price,
+        context.selectedSellSignal?.action ?? 'HOLD',
+        context.selectedSellSignal?.strategyName
+      );
+
+      if (exitReason) {
+        await this.closePosition(context.symbol, context.ticker.price, exitReason);
+        this.logRiskMetrics(`Risk metrics after closing position for ${context.symbol}`);
+        return;
+      }
+    }
+
+    if (
+      context.selectedBuySignal &&
+      context.selectedBuySignal.action === 'BUY' &&
+      context.selectedBuySignal.confidence >= this.entrySignalThreshold
+    ) {
+      if (!this.riskManager.validateRisk()) {
+        logger.warn(entryContext, 'Skipping BUY because portfolio risk limits are exceeded');
+        return;
+      }
+
+      if (context.atrPercent < this.minAtrPercentForEntry) {
+        logger.info(entryContext, 'Skipping BUY because volatility is too low for the pullback setup');
+        return;
+      }
+
+      if (existingPosition) {
+        logger.info(entryContext, 'Skipping BUY because a position is already open');
+        return;
+      }
+
+      const rawQuantity = this.calculateOrderQuantity(
+        context.ticker.price,
+        context.atr * this.stopLossAtrMultiple
+      );
+      const preparedOrder = await this.orderExecutor.prepareOrder({
+        symbol: context.symbol,
+        side: 'BUY',
+        type: 'MARKET',
+        quantity: rawQuantity,
+        price: context.ticker.price,
+        status: 'PENDING',
+      });
+
+      if (!this.riskManager.canOpenPosition(preparedOrder.quantity, context.ticker.price)) {
+        logger.warn(
+          {
+            symbol: context.symbol,
+            quantity: preparedOrder.quantity,
+            requestedQuantity: rawQuantity,
+            price: context.ticker.price,
+          },
+          'Skipping BUY because position would exceed exposure limits'
+        );
+        return;
+      }
+
+      const order = await this.orderExecutor.executeOrder({
+        symbol: preparedOrder.symbol,
+        side: preparedOrder.side,
+        type: preparedOrder.type,
+        quantity: preparedOrder.quantity,
+        price: preparedOrder.price,
+        stopPrice: preparedOrder.stopPrice,
+        status: preparedOrder.status,
+      });
+
+      logger.info({ order }, 'Order executed');
+      this.riskManager.openPosition(
+        order.symbol,
+        order.quantity,
+        order.averagePrice ?? context.ticker.price
+      );
+
+      this.journal.recordEntry({
+        id: order.id!,
+        symbol: context.symbol,
+        entryTime: order.timestamp,
+        entryPrice: order.averagePrice ?? context.ticker.price,
+        quantity: order.quantity,
+        side: 'BUY',
+        strategyName: context.selectedBuySignal.strategyName,
+        reason: context.selectedBuySignal.reasoning,
+        notes: `Confidence: ${context.selectedBuySignal.confidence.toFixed(2)}`,
+      });
+      this.openTrades.set(context.symbol, {
+        tradeId: order.id!,
+        entryAtr: context.atr,
+      });
+      await this.persistState(`position opened for ${context.symbol}`);
+      this.logRiskMetrics(`Risk metrics after opening position for ${context.symbol}`);
+      return;
+    }
+
+    logger.info(
+      {
+        ...entryContext,
+        action: context.selectedBuySignal?.action ?? 'HOLD',
+        confidence: context.selectedBuySignal?.confidence ?? 0,
+        topHoldReason:
+          context.strategySignals
+            .filter((signal) => signal.action === 'HOLD')
+            .sort((left, right) => right.confidence - left.confidence)[0]?.reasoning ?? null,
+      },
+      'No entry executed this cycle'
+    );
   }
 
   async runContinuous(intervalMs: number = 60000): Promise<void> {
@@ -372,7 +536,7 @@ class TradingSystem {
     }
 
     this.state = 'paused';
-    logger.warn({ symbol: this.symbol }, 'Trading paused');
+    logger.warn({ symbols: this.symbols }, 'Trading paused');
     await this.persistState('manual pause');
   }
 
@@ -382,24 +546,33 @@ class TradingSystem {
     }
 
     this.state = 'idle';
-    logger.warn({ symbol: this.symbol }, 'Trading resumed');
+    logger.warn({ symbols: this.symbols }, 'Trading resumed');
     await this.persistState('manual resume');
   }
 
-  async closeOpenPosition(reason: string = 'Manual close requested'): Promise<boolean> {
-    const position = this.riskManager.getPosition(this.symbol);
+  async closeOpenPosition(
+    reason: string = 'Manual close requested',
+    symbol?: string
+  ): Promise<boolean> {
+    const targetSymbol = symbol ? normalizeSymbol(symbol) : this.riskManager.getAllPositions()[0]?.symbol;
+    if (!targetSymbol) {
+      return false;
+    }
+
+    const position = this.riskManager.getPosition(targetSymbol);
     if (!position) {
       return false;
     }
 
-    const ticker = await this.marketDataProvider.getTicker(this.symbol);
-    await this.closePosition(ticker.price, reason);
+    const ticker = await this.marketDataProvider.getTicker(targetSymbol);
+    await this.closePosition(targetSymbol, ticker.price, reason);
     return true;
   }
 
   getStatus(): TradingSystemStatus {
     return {
-      symbol: this.symbol,
+      symbol: this.symbols[0] ?? '',
+      symbols: [...this.symbols],
       state: this.state,
       isCycleRunning: this.cyclePromise !== null,
       cycleIntervalMs: this.loopIntervalMs,
@@ -407,7 +580,8 @@ class TradingSystem {
       lastCycleCompletedAt: this.lastCycleCompletedAt,
       lastCycleError: this.lastCycleError,
       entrySignalThreshold: this.entrySignalThreshold,
-      openPosition: this.riskManager.getPosition(this.symbol),
+      openPosition: this.riskManager.getPosition(this.symbols[0] ?? ''),
+      openPositions: this.riskManager.getAllPositions(),
       riskMetrics: this.riskManager.getRiskMetrics(),
       journalStats: this.journal.calculateStats(),
       openOrders: this.orderExecutor.getOpenOrders(),
@@ -427,38 +601,49 @@ class TradingSystem {
     return this.riskManager;
   }
 
-  async restoreFromState(state: PersistedTradingState | null): Promise<void> {
+  async restoreFromState(
+    state: PersistedTradingState | LegacyPersistedTradingState | null
+  ): Promise<void> {
     if (state) {
-      if (state.symbol !== this.symbol) {
-        logger.warn(
-          { persistedSymbol: state.symbol, currentSymbol: this.symbol },
-          'Ignoring persisted state because it targets a different symbol'
-        );
-      } else {
-        this.journal.restoreTrades(state.journal);
-        this.orderExecutor.restoreOrders(state.orders);
-        this.riskManager.restoreState(state.risk);
-        this.openTrades = new Map(
-          state.openTrades.map((trade) => [
-            trade.symbol,
-            { tradeId: trade.tradeId, entryAtr: trade.entryAtr },
-          ])
-        );
-        this.loopIntervalMs = state.runtime.cycleIntervalMs;
-        this.lastCycleStartedAt = state.runtime.lastCycleStartedAt;
-        this.lastCycleCompletedAt = state.runtime.lastCycleCompletedAt;
-        this.lastCycleError = state.runtime.lastCycleError;
-        this.state = state.runtime.state === 'paused' ? 'paused' : 'idle';
+      const persistedSymbols = 'symbols' in state ? state.symbols : [state.symbol];
+      const normalizedPersistedSymbols = persistedSymbols.map((symbol) => normalizeSymbol(symbol));
+      const missingSymbols = normalizedPersistedSymbols.filter(
+        (symbol) => !this.symbols.includes(symbol)
+      );
 
-        logger.info(
-          {
-            filePath: this.stateStore.getFilePath(),
-            paused: this.state === 'paused',
-            openTradeCount: this.openTrades.size,
-          },
-          'Persisted trading state restored'
+      if (missingSymbols.length > 0) {
+        logger.warn(
+          { persistedSymbols: normalizedPersistedSymbols, currentSymbols: this.symbols, missingSymbols },
+          'Persisted state includes symbols not present in current config'
         );
       }
+
+      this.journal.restoreTrades(state.journal);
+      this.orderExecutor.restoreOrders(state.orders);
+      this.riskManager.restoreState(state.risk);
+      this.openTrades = new Map(
+        state.openTrades
+          .filter((trade) => this.symbols.includes(normalizeSymbol(trade.symbol)))
+          .map((trade) => [
+            normalizeSymbol(trade.symbol),
+            { tradeId: trade.tradeId, entryAtr: trade.entryAtr },
+          ])
+      );
+      this.loopIntervalMs = state.runtime.cycleIntervalMs;
+      this.lastCycleStartedAt = state.runtime.lastCycleStartedAt;
+      this.lastCycleCompletedAt = state.runtime.lastCycleCompletedAt;
+      this.lastCycleError = state.runtime.lastCycleError;
+      this.state = state.runtime.state === 'paused' ? 'paused' : 'idle';
+
+      logger.info(
+        {
+          filePath: this.stateStore.getFilePath(),
+          paused: this.state === 'paused',
+          openTradeCount: this.openTrades.size,
+          restoredSymbols: normalizedPersistedSymbols,
+        },
+        'Persisted trading state restored'
+      );
     }
 
     await this.reconcileWithExchange();
@@ -467,7 +652,7 @@ class TradingSystem {
 
   private async runCycleWithLock(): Promise<void> {
     if (this.cyclePromise) {
-      logger.warn({ symbol: this.symbol }, 'Skipping cycle because previous cycle is still running');
+      logger.warn({ symbols: this.symbols }, 'Skipping cycle because previous cycle is still running');
       return;
     }
 
@@ -496,12 +681,13 @@ class TradingSystem {
   }
 
   private getExitReason(
+    symbol: string,
     entryPrice: number,
     currentPrice: number,
-    signalAction: 'BUY' | 'SELL' | 'HOLD'
+    signalAction: 'BUY' | 'SELL' | 'HOLD',
+    strategyName?: string
   ): string | null {
-    const riskConfig = this.riskManager.getConfig();
-    const openTradeState = this.openTrades.get(this.symbol);
+    const openTradeState = this.openTrades.get(symbol);
     const openTrade = openTradeState
       ? this.journal.getTrade(openTradeState.tradeId)
       : undefined;
@@ -519,7 +705,7 @@ class TradingSystem {
     }
 
     if (signalAction === 'SELL') {
-      return 'Strategy exit signal';
+      return strategyName ? `Strategy exit signal from ${strategyName}` : 'Strategy exit signal';
     }
 
     if (openTrade && Date.now() - openTrade.entryTime >= this.maxHoldTimeMs) {
@@ -529,14 +715,14 @@ class TradingSystem {
     return null;
   }
 
-  private async closePosition(currentPrice: number, reason: string): Promise<void> {
-    const position = this.riskManager.getPosition(this.symbol);
+  private async closePosition(symbol: string, currentPrice: number, reason: string): Promise<void> {
+    const position = this.riskManager.getPosition(symbol);
     if (!position) {
       return;
     }
 
     const order = await this.orderExecutor.executeOrder({
-      symbol: this.symbol,
+      symbol,
       side: 'SELL',
       type: 'MARKET',
       quantity: position.quantity,
@@ -544,20 +730,20 @@ class TradingSystem {
       status: 'PENDING',
     });
 
-    logger.info({ order, reason }, 'Exit order executed');
-    this.riskManager.closePosition(this.symbol, order.averagePrice ?? currentPrice);
+    logger.info({ order, reason, symbol }, 'Exit order executed');
+    this.riskManager.closePosition(symbol, order.averagePrice ?? currentPrice);
 
-    const openTradeState = this.openTrades.get(this.symbol);
+    const openTradeState = this.openTrades.get(symbol);
     if (openTradeState) {
       this.journal.recordExit(
         openTradeState.tradeId,
         order.averagePrice ?? currentPrice,
         order.timestamp
       );
-      this.openTrades.delete(this.symbol);
+      this.openTrades.delete(symbol);
     }
 
-    await this.persistState(`position closed: ${reason}`);
+    await this.persistState(`position closed for ${symbol}: ${reason}`);
   }
 
   private logRiskMetrics(message: string): void {
@@ -601,95 +787,144 @@ class TradingSystem {
     return quantity;
   }
 
-  private async reconcileWithExchange(): Promise<void> {
-    const accountInfo = await this.orderExecutor.getAccountInfo();
-    const baseBalance = this.getAssetQuantity(accountInfo, this.baseAsset);
-    const quoteBalance = this.getAssetQuantity(accountInfo, this.quoteAsset);
-    const ticker = await this.marketDataProvider.getTicker(this.symbol);
-    const tradingRules = await this.orderExecutor.getSymbolTradingRules(this.symbol);
-    const baseNotional = baseBalance * ticker.price;
-    const localPosition = this.riskManager.getPosition(this.symbol);
-    const openTradeState = this.openTrades.get(this.symbol);
-    const openTrade = openTradeState
-      ? this.journal.getTrade(openTradeState.tradeId)
-      : undefined;
+  private buildStrategies(symbol: string, higherTimeframeCandles: CandleData[]): BaseStrategy[] {
+    const strategyConfigs: StrategyConfig[] = this.strategyTemplates
+      .filter((strategy) => strategy.enabled)
+      .map((strategy) => ({
+        type: strategy.type,
+        name: strategy.name,
+        symbol,
+        enabled: strategy.enabled,
+        parameters: {
+          ...strategy.parameters,
+          higherTimeframeCandles,
+        },
+      }));
 
-    if (baseBalance <= 0 || baseNotional < tradingRules.minNotional) {
-      if (localPosition) {
-        logger.warn(
-          {
-            symbol: this.symbol,
-            baseAsset: this.baseAsset,
-            baseBalance,
-            baseNotional,
-            minNotional: tradingRules.minNotional,
-          },
-          'Clearing local position because Binance reports only non-tradable base-asset dust'
-        );
-        this.riskManager.removePosition(this.symbol);
-        this.openTrades.delete(this.symbol);
-      } else {
-        this.riskManager.setAccountBalance(quoteBalance);
+    return strategyConfigs.map((config) => {
+      switch (config.type) {
+        case 'trend_pullback':
+          return new TrendPullbackStrategy(config);
+        case 'breakout_confirmation':
+          return new BreakoutConfirmationStrategy(config);
+        case 'mean_reversion_dip_buy':
+          return new MeanReversionDipBuyStrategy(config);
+        default:
+          throw new Error(`Unsupported strategy configuration: ${config.type}`);
       }
-
-      return;
-    }
-
-    const entryPrice = openTrade?.entryPrice ?? localPosition?.entryPrice ?? ticker.price;
-    const restoredPosition = this.buildPosition(baseBalance, entryPrice, ticker.price);
-
-    if (!localPosition) {
-      this.riskManager.upsertPosition(restoredPosition);
-      this.riskManager.setAccountBalance(quoteBalance);
-
-      if (!openTradeState) {
-        const syntheticTradeId = `RESTORED_${this.symbol}_${Date.now()}`;
-        this.journal.recordEntry({
-          id: syntheticTradeId,
-          symbol: this.symbol,
-          entryTime: Date.now(),
-          entryPrice,
-          quantity: baseBalance,
-          side: 'BUY',
-          strategyName: 'State Reconciliation',
-          reason: 'Reconstructed from exchange balances',
-          notes: 'Recovered open position on startup',
-        });
-        this.openTrades.set(this.symbol, {
-          tradeId: syntheticTradeId,
-          entryAtr: 0,
-        });
-      }
-
-      logger.warn(
-        { symbol: this.symbol, quantity: baseBalance, entryPrice },
-        'Rebuilt missing local position from Binance balances'
-      );
-      return;
-    }
-
-    this.riskManager.upsertPosition({
-      ...restoredPosition,
-      entryPrice: openTrade?.entryPrice ?? localPosition.entryPrice,
     });
-
-    logger.info(
-      {
-        symbol: this.symbol,
-        exchangeQuantity: baseBalance,
-        localQuantity: localPosition.quantity,
-      },
-      'Reconciled local position with Binance balances'
-    );
   }
 
-  private buildPosition(quantity: number, entryPrice: number, currentPrice: number): Position {
+  private selectBestCandidate(signals: StrategySignal[]): RankedStrategyCandidate | null {
+    if (signals.length === 0) {
+      return null;
+    }
+
+    const rankedSignals = signals
+      .map((signal) => ({
+        ...signal,
+        rankScore: signal.confidence,
+      }))
+      .sort((left, right) => right.rankScore - left.rankScore);
+
+    return rankedSignals[0];
+  }
+
+  private async reconcileWithExchange(): Promise<void> {
+    const accountInfo = await this.orderExecutor.getAccountInfo();
+    const quoteBalance = this.getAssetQuantity(accountInfo, this.quoteAsset);
+    this.riskManager.setAccountBalance(quoteBalance);
+
+    for (const symbol of this.symbols) {
+      const baseAsset = this.baseAssets[symbol];
+      const baseBalance = this.getAssetQuantity(accountInfo, baseAsset);
+      const ticker = await this.marketDataProvider.getTicker(symbol);
+      const tradingRules = await this.orderExecutor.getSymbolTradingRules(symbol);
+      const baseNotional = baseBalance * ticker.price;
+      const localPosition = this.riskManager.getPosition(symbol);
+      const openTradeState = this.openTrades.get(symbol);
+      const openTrade = openTradeState
+        ? this.journal.getTrade(openTradeState.tradeId)
+        : undefined;
+
+      if (baseBalance <= 0 || baseNotional < tradingRules.minNotional) {
+        if (localPosition) {
+          logger.warn(
+            {
+              symbol,
+              baseAsset,
+              baseBalance,
+              baseNotional,
+              minNotional: tradingRules.minNotional,
+            },
+            'Clearing local position because Binance reports only non-tradable base-asset dust'
+          );
+          this.riskManager.removePosition(symbol);
+          this.openTrades.delete(symbol);
+        }
+        continue;
+      }
+
+      const entryPrice = openTrade?.entryPrice ?? localPosition?.entryPrice ?? ticker.price;
+      const restoredPosition = this.buildPosition(symbol, baseBalance, entryPrice, ticker.price);
+
+      if (!localPosition) {
+        this.riskManager.upsertPosition(restoredPosition);
+
+        if (!openTradeState) {
+          const syntheticTradeId = `RESTORED_${symbol}_${Date.now()}`;
+          this.journal.recordEntry({
+            id: syntheticTradeId,
+            symbol,
+            entryTime: Date.now(),
+            entryPrice,
+            quantity: baseBalance,
+            side: 'BUY',
+            strategyName: 'State Reconciliation',
+            reason: 'Reconstructed from exchange balances',
+            notes: 'Recovered open position on startup',
+          });
+          this.openTrades.set(symbol, {
+            tradeId: syntheticTradeId,
+            entryAtr: 0,
+          });
+        }
+
+        logger.warn(
+          { symbol, quantity: baseBalance, entryPrice },
+          'Rebuilt missing local position from Binance balances'
+        );
+        continue;
+      }
+
+      this.riskManager.upsertPosition({
+        ...restoredPosition,
+        entryPrice: openTrade?.entryPrice ?? localPosition.entryPrice,
+      });
+
+      logger.info(
+        {
+          symbol,
+          exchangeQuantity: baseBalance,
+          localQuantity: localPosition.quantity,
+        },
+        'Reconciled local position with Binance balances'
+      );
+    }
+  }
+
+  private buildPosition(
+    symbol: string,
+    quantity: number,
+    entryPrice: number,
+    currentPrice: number
+  ): Position {
     const unrealizedPnL = (currentPrice - entryPrice) * quantity;
     const unrealizedPnLPercent =
       entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
 
     return {
-      symbol: this.symbol,
+      symbol,
       quantity,
       entryPrice,
       currentPrice,
@@ -708,9 +943,9 @@ class TradingSystem {
 
   private async persistState(reason: string): Promise<void> {
     const state: PersistedTradingState = {
-      version: 1,
+      version: 2,
       savedAt: Date.now(),
-      symbol: this.symbol,
+      symbols: [...this.symbols],
       runtime: {
         state: this.state === 'paused' ? 'paused' : 'idle',
         cycleIntervalMs: this.loopIntervalMs,
@@ -831,7 +1066,10 @@ class ControlServer {
         const closed = await this.system.closeOpenPosition(
           typeof body.reason === 'string' && body.reason.trim().length > 0
             ? body.reason
-            : 'Manual close requested'
+            : 'Manual close requested',
+          typeof body.symbol === 'string' && body.symbol.trim().length > 0
+            ? body.symbol
+            : undefined
         );
         this.sendJson(res, 200, {
           closed,
@@ -967,9 +1205,18 @@ async function main(): Promise<void> {
   const environment = getBinanceEnvironment();
   const isLive = environment === 'live';
   const dryRun = getDryRunMode();
-  const tradingSymbol = getTradingSymbol();
-  const quoteAsset = getQuoteAsset(tradingSymbol);
-  const baseAsset = getBaseAsset(tradingSymbol);
+  const botConfig = await loadBotConfig();
+  const quoteAssets = Array.from(new Set(botConfig.symbols.map((symbol) => getQuoteAsset(symbol))));
+  if (quoteAssets.length !== 1) {
+    throw new Error(
+      `All configured symbols must share the same quote asset. Found: ${quoteAssets.join(', ')}`
+    );
+  }
+
+  const quoteAsset = quoteAssets[0];
+  const baseAssets = Object.fromEntries(
+    botConfig.symbols.map((symbol) => [symbol, getBaseAsset(symbol)])
+  ) as Record<string, string>;
   const controlServerConfig = getControlServerConfig();
   const stateStore = new FileStateStore(getStateFilePath());
   const liveMaxOrderNotional = getLiveMaxOrderNotional();
@@ -1009,7 +1256,7 @@ async function main(): Promise<void> {
 
   if (quoteAssetBalance <= 0) {
     throw new Error(
-      `No available ${quoteAsset} balance found for trading symbol ${tradingSymbol}`
+      `No available ${quoteAsset} balance found for configured symbols ${botConfig.symbols.join(', ')}`
     );
   }
 
@@ -1017,9 +1264,11 @@ async function main(): Promise<void> {
     {
       environment,
       dryRun,
-      tradingSymbol,
+      symbols: botConfig.symbols,
+      strategyNames: botConfig.strategies.filter((strategy) => strategy.enabled).map((strategy) => strategy.name),
       quoteAsset,
-      baseAsset,
+      baseAssets,
+      configFile: getConfigFilePath(),
       stateFile: stateStore.getFilePath(),
       liveMaxOrderNotional,
       baseURL:
@@ -1041,12 +1290,13 @@ async function main(): Promise<void> {
     executionConfig,
     riskConfig,
     persistedState?.risk.accountBalance ?? quoteAssetBalance,
-    tradingSymbol,
+    botConfig.symbols,
     {
       quoteAsset,
-      baseAsset,
+      baseAssets,
       stateStore,
       liveMaxOrderNotional,
+      strategyTemplates: botConfig.strategies,
     }
   );
 

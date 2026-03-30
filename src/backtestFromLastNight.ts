@@ -173,6 +173,7 @@ async function main(): Promise<void> {
     );
 
     const strategyConfig: StrategyConfig = {
+      type: 'trend_pullback',
       name: 'Trend Pullback Strategy',
       symbol: SYMBOL,
       enabled: true,

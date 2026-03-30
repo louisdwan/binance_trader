@@ -20,6 +20,17 @@ export type PersistedRuntimeState = {
 };
 
 export type PersistedTradingState = {
+  version: 2;
+  savedAt: number;
+  symbols: string[];
+  runtime: PersistedRuntimeState;
+  openTrades: PersistedOpenTrade[];
+  risk: RiskManagerState;
+  journal: TradeEntry[];
+  orders: Order[];
+};
+
+export type LegacyPersistedTradingState = {
   version: 1;
   savedAt: number;
   symbol: string;
@@ -37,7 +48,7 @@ export class FileStateStore {
     this.filePath = filePath;
   }
 
-  async load(): Promise<PersistedTradingState | null> {
+  async load(): Promise<PersistedTradingState | LegacyPersistedTradingState | null> {
     try {
       const raw = await fs.readFile(this.filePath, 'utf8');
       return JSON.parse(raw) as PersistedTradingState;

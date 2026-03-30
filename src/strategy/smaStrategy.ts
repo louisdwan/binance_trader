@@ -27,6 +27,7 @@ export class SimpleMovingAverageStrategy extends BaseStrategy {
 
     if (fastSMA === 0 || slowSMA === 0) {
       return {
+        strategyName: this.getName(),
         action: 'HOLD',
         confidence: 0,
         reasoning: 'Insufficient data for analysis',
@@ -50,6 +51,7 @@ export class SimpleMovingAverageStrategy extends BaseStrategy {
     }
 
     const signal: StrategySignal = {
+      strategyName: this.getName(),
       action,
       confidence,
       reasoning,

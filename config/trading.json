@@ -1,0 +1,44 @@
+{
+  "symbols": [
+    "BTCEUR",
+    "ETHEUR"
+  ],
+  "strategies": [
+    {
+      "type": "trend_pullback",
+      "name": "Trend Pullback Strategy",
+      "enabled": true,
+      "parameters": {
+        "fastPeriod": 5,
+        "pullbackPeriod": 20,
+        "trendPeriod": 200,
+        "pullbackTolerancePercent": 0.15,
+        "trendBufferPercent": 0.35,
+        "minTrendStrengthPercent": 0.03
+      }
+    },
+    {
+      "type": "breakout_confirmation",
+      "name": "Breakout Confirmation Strategy",
+      "enabled": true,
+      "parameters": {
+        "breakoutLookback": 20,
+        "volumeLookback": 20,
+        "breakoutBufferPercent": 0.05,
+        "volumeMultiplier": 1.2,
+        "trendPeriod": 200
+      }
+    },
+    {
+      "type": "mean_reversion_dip_buy",
+      "name": "Mean Reversion Dip Buy Strategy",
+      "enabled": true,
+      "parameters": {
+        "bandPeriod": 20,
+        "bandStdDevMultiplier": 2,
+        "trendPeriod": 200,
+        "reclaimPercent": 0.05
+      }
+    }
+  ]
+}

@@ -47,6 +47,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
       higherTimeframeCandles.length < this.trendPeriod + 1
     ) {
       return {
+        strategyName: this.getName(),
         action: 'HOLD',
         confidence: 0,
         reasoning: 'Insufficient data for trend pullback analysis',
@@ -74,6 +75,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
       previousTrendEma === 0
     ) {
       return {
+        strategyName: this.getName(),
         action: 'HOLD',
         confidence: 0,
         reasoning: 'Unable to calculate EMA inputs',
@@ -162,6 +164,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
       );
 
       const signal: StrategySignal = {
+        strategyName: this.getName(),
         action: 'BUY',
         confidence,
         reasoning:
@@ -176,6 +179,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
 
     if (trendDown) {
       const signal: StrategySignal = {
+        strategyName: this.getName(),
         action: 'SELL',
         confidence: Math.min(
           1,
@@ -192,6 +196,7 @@ export class TrendPullbackStrategy extends BaseStrategy {
     }
 
     const signal: StrategySignal = {
+      strategyName: this.getName(),
       action: 'HOLD',
       confidence: 0,
       reasoning:
