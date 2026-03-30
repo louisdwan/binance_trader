@@ -2,7 +2,9 @@ module.exports = {
   apps: [
     {
       name: 'binance-spot-trader',
-      script: 'dist/index.js',
+      script: 'src/index.ts',
+      interpreter: 'npx',
+      interpreter_args: 'tsx',
       cwd: __dirname,
       instances: 1,
       exec_mode: 'fork',
