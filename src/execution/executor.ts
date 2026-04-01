@@ -38,6 +38,23 @@ type ServerTimeOffset = {
   syncedAt: number;
 };
 
+export type OrderStateNormalizationContext = {
+  now?: number;
+  knownEntryOrderIds?: Set<string>;
+  symbolsWithOpenPositions?: Set<string>;
+  latestExitTimeBySymbol?: Map<string, number>;
+};
+
+export type OrderStateNormalizationResult = {
+  normalizedAt: number;
+  staleThresholdMs: number;
+  stalePendingOrdersFound: number;
+  reclassifiedFilled: number;
+  reclassifiedFailed: number;
+  unresolvedStaleOrders: number;
+  touchedOrderIds: string[];
+};
+
 export class OrderExecutor {
   private static readonly serverTimeCacheTtlMs = 60_000;
   private static readonly pendingOrderStaleAfterMs = 5 * 60 * 1000;
@@ -151,6 +168,56 @@ export class OrderExecutor {
     logger.info({ orderCount: orders.length }, 'Order executor restored from persisted state');
   }
 
+  normalizeOrderState(
+    context: OrderStateNormalizationContext = {}
+  ): OrderStateNormalizationResult {
+    const now = context.now ?? Date.now();
+    let stalePendingOrdersFound = 0;
+    let reclassifiedFilled = 0;
+    let reclassifiedFailed = 0;
+    const touchedOrderIds: string[] = [];
+
+    for (const order of this.orders.values()) {
+      if (order.status !== 'PENDING') {
+        continue;
+      }
+
+      if (!this.isStalePendingOrder(order, now)) {
+        continue;
+      }
+
+      stalePendingOrdersFound += 1;
+
+      if (order.type !== 'MARKET') {
+        continue;
+      }
+
+      const nextStatus = this.inferFinalStatusForStaleMarketOrder(order, context);
+      if (!nextStatus) {
+        continue;
+      }
+
+      order.status = nextStatus;
+      touchedOrderIds.push(String(order.id));
+      if (nextStatus === 'FILLED') {
+        reclassifiedFilled += 1;
+      } else if (nextStatus === 'FAILED') {
+        reclassifiedFailed += 1;
+      }
+    }
+
+    return {
+      normalizedAt: now,
+      staleThresholdMs: OrderExecutor.pendingOrderStaleAfterMs,
+      stalePendingOrdersFound,
+      reclassifiedFilled,
+      reclassifiedFailed,
+      unresolvedStaleOrders:
+        stalePendingOrdersFound - reclassifiedFilled - reclassifiedFailed,
+      touchedOrderIds,
+    };
+  }
+
   getOpenOrders(): Order[] {
     const now = Date.now();
     return Array.from(this.orders.values()).filter(
@@ -159,6 +226,10 @@ export class OrderExecutor {
         (order.status === 'PENDING' &&
           now - order.timestamp <= OrderExecutor.pendingOrderStaleAfterMs)
     );
+  }
+
+  static getPendingOrderStaleAfterMs(): number {
+    return OrderExecutor.pendingOrderStaleAfterMs;
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
@@ -392,14 +463,24 @@ export class OrderExecutor {
     );
     const requestTimestamp = Number(response.config.params?.timestamp ?? Date.now());
 
+    const quantity = Number(response.data.origQty ?? order.quantity);
+    const filledQuantity = Number(response.data.executedQty ?? 0);
+    const averagePrice = this.extractAveragePrice(response.data, order);
+
     return {
       ...order,
       id: String(response.data.orderId ?? order.id),
       timestamp: Number(response.data.transactTime ?? requestTimestamp),
-      status: this.mapBinanceOrderStatus(response.data.status),
-      quantity: Number(response.data.origQty ?? order.quantity),
-      filledQuantity: Number(response.data.executedQty ?? 0),
-      averagePrice: this.extractAveragePrice(response.data, order),
+      status: this.resolveSubmittedOrderStatus(
+        order,
+        this.mapBinanceOrderStatus(response.data.status),
+        quantity,
+        filledQuantity,
+        averagePrice
+      ),
+      quantity,
+      filledQuantity,
+      averagePrice,
     };
   }
 
@@ -434,6 +515,28 @@ export class OrderExecutor {
     }
   }
 
+  private resolveSubmittedOrderStatus(
+    order: PreparedOrder,
+    mappedStatus: Order['status'],
+    quantity: number,
+    filledQuantity: number,
+    averagePrice: number | undefined
+  ): Order['status'] {
+    if (mappedStatus !== 'PENDING') {
+      return mappedStatus;
+    }
+
+    if (filledQuantity > 0 && filledQuantity >= quantity) {
+      return 'FILLED';
+    }
+
+    if (filledQuantity > 0 || (order.type === 'MARKET' && averagePrice !== undefined)) {
+      return 'OPEN';
+    }
+
+    return mappedStatus;
+  }
+
   private extractAveragePrice(responseData: any, order: PreparedOrder): number | undefined {
     const executedQty = Number(responseData.executedQty ?? 0);
     const cumulativeQuoteQty = Number(responseData.cummulativeQuoteQty ?? 0);
@@ -460,6 +563,52 @@ export class OrderExecutor {
 
   private formatValue(value: number): string {
     return value.toFixed(16).replace(/\.?0+$/, '');
+  }
+
+  private isStalePendingOrder(order: Order, now: number): boolean {
+    return (
+      order.status === 'PENDING' &&
+      now - order.timestamp > OrderExecutor.pendingOrderStaleAfterMs
+    );
+  }
+
+  private inferFinalStatusForStaleMarketOrder(
+    order: Order,
+    context: OrderStateNormalizationContext
+  ): Order['status'] | null {
+    if (order.type !== 'MARKET' || order.status !== 'PENDING') {
+      return null;
+    }
+
+    if ((order.filledQuantity ?? 0) > 0 || order.averagePrice !== undefined) {
+      return 'FILLED';
+    }
+
+    const knownEntryOrderIds = context.knownEntryOrderIds ?? new Set<string>();
+    const symbolsWithOpenPositions = context.symbolsWithOpenPositions ?? new Set<string>();
+    const latestExitTimeBySymbol = context.latestExitTimeBySymbol ?? new Map<string, number>();
+
+    if (order.side === 'BUY') {
+      if (
+        (order.id && knownEntryOrderIds.has(String(order.id))) ||
+        symbolsWithOpenPositions.has(order.symbol)
+      ) {
+        return 'FILLED';
+      }
+
+      return 'FAILED';
+    }
+
+    const latestExitTime = latestExitTimeBySymbol.get(order.symbol);
+    if (latestExitTime !== undefined && latestExitTime >= order.timestamp) {
+      return 'FILLED';
+    }
+
+    if (!symbolsWithOpenPositions.has(order.symbol)) {
+      return 'FAILED';
+    }
+
+    return null;
   }
 
   private generateOrderId(): string {

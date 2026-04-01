@@ -12,6 +12,7 @@
     "analyze": "tsx src/strategyExample.ts",
     "paper": "tsx src/executionExample.ts",
     "journal": "tsx src/journalExample.ts",
+    "test": "node --import tsx --test src/staleOrderState.test.ts",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write src"
   },

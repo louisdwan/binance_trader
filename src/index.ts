@@ -2,6 +2,7 @@ import 'dotenv/config';
 import fs from 'fs/promises';
 import http, { type IncomingMessage, type ServerResponse } from 'http';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import logger from './logger';
 import {
   MarketDataProvider,
@@ -21,6 +22,7 @@ import {
   type ExecutionConfig,
   type AccountBalance,
   type AccountInfo,
+  type OrderStateNormalizationResult,
 } from './execution';
 import { RiskManager, type RiskConfig, type Position } from './risk';
 import { TradeJournal } from './journal';
@@ -65,6 +67,8 @@ type OperatorStateCode =
 type FailureType =
   | 'market-data'
   | 'exchange'
+  | 'order-lifecycle'
+  | 'reconciliation'
   | 'risk'
   | 'validation'
   | 'state'
@@ -195,6 +199,13 @@ type OperatorStatusPayload = TradingSystemStatus & {
   failures: {
     countsByType: Record<FailureType, number>;
     lastError: OperatorLastError | null;
+  };
+  reconciliation: {
+    orders: OrderStateNormalizationResult & {
+      lastReason: string | null;
+      cumulativeReclassifiedFilled: number;
+      cumulativeReclassifiedFailed: number;
+    };
   };
 };
 
@@ -424,9 +435,23 @@ class TradingSystem {
   private lastAccountSnapshotAt: number | null = null;
   private lastJournalUpdatedAt: number | null = null;
   private lastError: OperatorLastError | null = null;
+  private lastOrderNormalization: OperatorStatusPayload['reconciliation']['orders'] = {
+    normalizedAt: 0,
+    staleThresholdMs: OrderExecutor.getPendingOrderStaleAfterMs(),
+    stalePendingOrdersFound: 0,
+    reclassifiedFilled: 0,
+    reclassifiedFailed: 0,
+    unresolvedStaleOrders: 0,
+    touchedOrderIds: [],
+    lastReason: null,
+    cumulativeReclassifiedFilled: 0,
+    cumulativeReclassifiedFailed: 0,
+  };
   private failureCounts: Record<FailureType, number> = {
     'market-data': 0,
     exchange: 0,
+    'order-lifecycle': 0,
+    reconciliation: 0,
     risk: 0,
     validation: 0,
     state: 0,
@@ -865,6 +890,12 @@ class TradingSystem {
         countsByType: { ...this.failureCounts },
         lastError: this.lastError ? { ...this.lastError } : null,
       },
+      reconciliation: {
+        orders: {
+          ...this.lastOrderNormalization,
+          touchedOrderIds: [...this.lastOrderNormalization.touchedOrderIds],
+        },
+      },
     };
   }
 
@@ -1163,6 +1194,61 @@ class TradingSystem {
     });
   }
 
+  private normalizeLocalOrderState(reason: string): void {
+    const trades = this.journal.getAllTrades();
+    const result = this.orderExecutor.normalizeOrderState({
+      now: Date.now(),
+      knownEntryOrderIds: new Set(
+        trades
+          .map((trade) => trade.id)
+          .filter((tradeId) => !String(tradeId).startsWith('RESTORED_'))
+      ),
+      symbolsWithOpenPositions: new Set(
+        this.riskManager.getAllPositions().map((position) => position.symbol)
+      ),
+      latestExitTimeBySymbol: trades.reduce((latest, trade) => {
+        if (trade.exitTime !== undefined) {
+          latest.set(
+            trade.symbol,
+            Math.max(latest.get(trade.symbol) ?? 0, trade.exitTime)
+          );
+        }
+        return latest;
+      }, new Map<string, number>()),
+    });
+
+    this.lastOrderNormalization = {
+      ...result,
+      touchedOrderIds: [...result.touchedOrderIds],
+      lastReason: reason,
+      cumulativeReclassifiedFilled:
+        this.lastOrderNormalization.cumulativeReclassifiedFilled + result.reclassifiedFilled,
+      cumulativeReclassifiedFailed:
+        this.lastOrderNormalization.cumulativeReclassifiedFailed + result.reclassifiedFailed,
+    };
+
+    if (result.reclassifiedFilled > 0 || result.reclassifiedFailed > 0) {
+      logger.warn(
+        {
+          reason,
+          reclassifiedFilled: result.reclassifiedFilled,
+          reclassifiedFailed: result.reclassifiedFailed,
+          touchedOrderIds: result.touchedOrderIds,
+        },
+        'Normalized stale local market-order state'
+      );
+    }
+
+    if (result.unresolvedStaleOrders > 0) {
+      this.recordFailure(
+        'order-reconciliation',
+        new Error(
+          `Unresolved stale local orders remain after ${reason}: ${result.unresolvedStaleOrders}`
+        )
+      );
+    }
+  }
+
   private recordFailure(source: string, error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     const type = this.classifyFailure(message, source);
@@ -1185,10 +1271,26 @@ class TradingSystem {
     if (
       haystack.includes('binance') ||
       haystack.includes('exchange') ||
-      haystack.includes('order') ||
       haystack.includes('account')
     ) {
       return 'exchange';
+    }
+
+    if (
+      haystack.includes('reconcile') ||
+      haystack.includes('reconciliation') ||
+      haystack.includes('stale local orders')
+    ) {
+      return 'reconciliation';
+    }
+
+    if (
+      haystack.includes('order') ||
+      haystack.includes('pending') ||
+      haystack.includes('filled') ||
+      haystack.includes('cancelled')
+    ) {
+      return 'order-lifecycle';
     }
 
     if (haystack.includes('risk') || haystack.includes('drawdown') || haystack.includes('loss')) {
@@ -1263,6 +1365,7 @@ class TradingSystem {
       this.state = state.runtime.state === 'paused' ? 'paused' : 'idle';
       this.pauseReason = this.state === 'paused' ? 'Restored paused state from persisted runtime' : null;
       this.stateUpdatedAt = Date.now();
+      this.normalizeLocalOrderState('restored persisted state');
 
       logger.info(
         {
@@ -1276,6 +1379,7 @@ class TradingSystem {
     }
 
     await this.reconcileWithExchange();
+    this.normalizeLocalOrderState('startup reconciliation');
     await this.persistState('startup reconciliation');
   }
 
@@ -1570,6 +1674,8 @@ class TradingSystem {
         'Reconciled local position with Binance balances'
       );
     }
+
+    this.normalizeLocalOrderState('exchange reconciliation');
   }
 
   private buildPosition(
@@ -1968,9 +2074,15 @@ async function main(): Promise<void> {
   await system.runContinuous(60000);
 }
 
-main().catch((error) => {
-  logger.error({ error }, 'Fatal error in main');
-  process.exit(1);
-});
+const isDirectExecution =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectExecution) {
+  main().catch((error) => {
+    logger.error({ error }, 'Fatal error in main');
+    process.exit(1);
+  });
+}
 
 export { TradingSystem };

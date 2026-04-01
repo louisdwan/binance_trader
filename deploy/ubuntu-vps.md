@@ -2,6 +2,9 @@
 
 This runbook mirrors the futures bot deployment pattern while keeping the spot bot isolated.
 
+This document is for first-time setup. For ongoing code updates on the live VPS, use
+[`spot-vps-update.md`](./spot-vps-update.md).
+
 Assumptions:
 
 - Ubuntu 24.04 LTS
@@ -98,6 +101,11 @@ curl http://127.0.0.1:3002/status -H "Authorization: Bearer replace_with_long_ra
 ```
 
 `/health` is for liveness checks. Use `/status` for operator supervision and strategy state.
+
+If `/status` ever reports stale open orders, also check `reconciliation.orders` in the payload. The bot now
+normalizes obviously dead local `PENDING` market-order artifacts during restore/reconciliation, so a large
+ancient `PENDING` market-order backlog should now indicate a genuine unresolved integrity issue rather than
+normal historical residue.
 
 ## 7. Private operator access from your own machine
 
