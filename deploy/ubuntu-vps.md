@@ -107,6 +107,10 @@ normalizes obviously dead local `PENDING` market-order artifacts during restore/
 ancient `PENDING` market-order backlog should now indicate a genuine unresolved integrity issue rather than
 normal historical residue.
 
+If a live exit fails with Binance `-2010` insufficient balance, keep the bot paused and inspect `/status`.
+The bot now clamps exit quantity to exchange-available balance first, so repeated `-2010` failures after this
+point indicate a deeper exchange/local state mismatch rather than a simple oversized local sell request.
+
 ## 7. Private operator access from your own machine
 
 Run this from your local machine:

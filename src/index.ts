@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import axios from 'axios';
 import fs from 'fs/promises';
 import http, { type IncomingMessage, type ServerResponse } from 'http';
 import path from 'path';
@@ -1061,6 +1062,20 @@ class TradingSystem {
   ): { action: RecommendedAction; reason: string } {
     if (reasonCode === 'paused-manual') {
       const blockers = this.getRiskBlockers();
+      if (severity === 'critical' && status.openPositions.length > 0) {
+        return {
+          action: 'close-position',
+          reason: 'Bot is paused, but a critical open-position issue still needs operator resolution',
+        };
+      }
+
+      if (severity === 'critical') {
+        return {
+          action: 'none',
+          reason: 'Bot is paused while a critical issue remains unresolved',
+        };
+      }
+
       if (blockers.length === 0) {
         return {
           action: 'resume',
@@ -1251,7 +1266,7 @@ class TradingSystem {
 
   private recordFailure(source: string, error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
-    const type = this.classifyFailure(message, source);
+    const type = this.classifyFailure(error, source, message);
     this.failureCounts[type] += 1;
     this.lastError = {
       type,
@@ -1261,8 +1276,24 @@ class TradingSystem {
     };
   }
 
-  private classifyFailure(message: string, source: string): FailureType {
+  private classifyFailure(error: unknown, source: string, message: string): FailureType {
     const haystack = `${source} ${message}`.toLowerCase();
+
+    if (axios.isAxiosError(error)) {
+      const payload = error.response?.data as { code?: number; msg?: string } | undefined;
+      const exchangeMessage = payload?.msg?.toLowerCase() ?? '';
+      if (typeof payload?.code === 'number' || exchangeMessage.length > 0) {
+        if (
+          payload?.code === -2010 ||
+          exchangeMessage.includes('insufficient balance') ||
+          exchangeMessage.includes('requested action')
+        ) {
+          return 'exchange';
+        }
+
+        return 'exchange';
+      }
+    }
 
     if (haystack.includes('candle') || haystack.includes('ticker') || haystack.includes('market')) {
       return 'market-data';
@@ -1310,6 +1341,19 @@ class TradingSystem {
     }
 
     return 'unknown';
+  }
+
+  private isInsufficientBalanceError(error: unknown): boolean {
+    if (!axios.isAxiosError(error)) {
+      return false;
+    }
+
+    const payload = error.response?.data as { code?: number; msg?: string } | undefined;
+    if (payload?.code === -2010) {
+      return true;
+    }
+
+    return payload?.msg?.toLowerCase().includes('insufficient balance') ?? false;
   }
 
   getJournal(): TradeJournal {
@@ -1413,6 +1457,7 @@ class TradingSystem {
         this.state = 'idle';
         this.stateUpdatedAt = Date.now();
       }
+      this.normalizeLocalOrderState('cycle completion');
       await this.persistState('cycle completion');
     }
   }
@@ -1463,12 +1508,38 @@ class TradingSystem {
       ? await this.orderExecutor.getAssetBalance(baseAsset)
       : null;
     const freeBaseQuantity = Math.max(baseAssetBalance?.free ?? 0, 0);
-    const exitQuantity =
+    const exchangeUsableQuantity =
       freeBaseQuantity > 0
-        ? Math.min(position.quantity, freeBaseQuantity)
-        : position.quantity;
+        ? await this.orderExecutor.normalizeSymbolQuantity(
+            symbol,
+            Math.min(position.quantity, freeBaseQuantity)
+          )
+        : 0;
 
-    if (exitQuantity <= 0) {
+    if (exchangeUsableQuantity > 0 && exchangeUsableQuantity < position.quantity) {
+      this.riskManager.upsertPosition({
+        ...position,
+        quantity: exchangeUsableQuantity,
+        currentPrice,
+        unrealizedPnL: (currentPrice - position.entryPrice) * exchangeUsableQuantity,
+        unrealizedPnLPercent:
+          position.entryPrice > 0
+            ? ((currentPrice - position.entryPrice) / position.entryPrice) * 100
+            : 0,
+      });
+      logger.warn(
+        {
+          symbol,
+          localQuantity: position.quantity,
+          freeBaseQuantity,
+          exchangeUsableQuantity,
+          reason,
+        },
+        'Adjusted local position quantity down to exchange-available balance before exit'
+      );
+    }
+
+    if (exchangeUsableQuantity <= 0) {
       logger.warn(
         {
           symbol,
@@ -1479,17 +1550,36 @@ class TradingSystem {
         },
         'Skipping exit because no free base-asset balance is available'
       );
+      await this.reconcileSymbolWithExchange(symbol);
+      this.normalizeLocalOrderState(`exit skipped without free balance for ${symbol}`);
       return;
     }
 
-    const order = await this.orderExecutor.executeOrder({
-      symbol,
-      side: 'SELL',
-      type: 'MARKET',
-      quantity: exitQuantity,
-      price: currentPrice,
-      status: 'PENDING',
-    });
+    let order;
+    try {
+      order = await this.orderExecutor.executeOrder({
+        symbol,
+        side: 'SELL',
+        type: 'MARKET',
+        quantity: exchangeUsableQuantity,
+        price: currentPrice,
+        status: 'PENDING',
+      });
+    } catch (error) {
+      if (this.isInsufficientBalanceError(error)) {
+        logger.warn(
+          {
+            symbol,
+            requestedQuantity: exchangeUsableQuantity,
+            reason,
+          },
+          'Exit order rejected due to insufficient exchange balance; reconciling local position state'
+        );
+        await this.reconcileSymbolWithExchange(symbol);
+        this.normalizeLocalOrderState(`insufficient-balance exit reconciliation for ${symbol}`);
+      }
+      throw error;
+    }
 
     logger.info({ order, reason, symbol }, 'Exit order executed');
     this.riskManager.closePosition(symbol, order.averagePrice ?? currentPrice);
@@ -1596,86 +1686,112 @@ class TradingSystem {
     const accountInfo = await this.orderExecutor.getAccountInfo();
     this.lastAccountSnapshotAt = accountInfo.updateTime || Date.now();
     const quoteBalance = this.getAssetQuantity(accountInfo, this.quoteAsset);
-    this.riskManager.setAccountBalance(quoteBalance);
+    const previousEffectiveBalance = this.riskManager.getAccountBalance();
 
     for (const symbol of this.symbols) {
-      const baseAsset = this.baseAssets[symbol];
-      const baseBalance = this.getAssetQuantity(accountInfo, baseAsset);
-      const ticker = await this.marketDataProvider.getTicker(symbol);
-      const tradingRules = await this.orderExecutor.getSymbolTradingRules(symbol);
-      const baseNotional = baseBalance * ticker.price;
-      const localPosition = this.riskManager.getPosition(symbol);
-      const openTradeState = this.openTrades.get(symbol);
-      const openTrade = openTradeState
-        ? this.journal.getTrade(openTradeState.tradeId)
-        : undefined;
-
-      if (baseBalance <= 0 || baseNotional < tradingRules.minNotional) {
-        if (localPosition) {
-          logger.warn(
-            {
-              symbol,
-              baseAsset,
-              baseBalance,
-              baseNotional,
-              minNotional: tradingRules.minNotional,
-            },
-            'Clearing local position because Binance reports only non-tradable base-asset dust'
-          );
-          this.riskManager.removePosition(symbol);
-          this.openTrades.delete(symbol);
-        }
-        continue;
-      }
-
-      const entryPrice = openTrade?.entryPrice ?? localPosition?.entryPrice ?? ticker.price;
-      const restoredPosition = this.buildPosition(symbol, baseBalance, entryPrice, ticker.price);
-
-      if (!localPosition) {
-        this.riskManager.upsertPosition(restoredPosition);
-
-        if (!openTradeState) {
-          const syntheticTradeId = `RESTORED_${symbol}_${Date.now()}`;
-          this.journal.recordEntry({
-            id: syntheticTradeId,
-            symbol,
-            entryTime: Date.now(),
-            entryPrice,
-            quantity: baseBalance,
-            side: 'BUY',
-            strategyName: 'State Reconciliation',
-            reason: 'Reconstructed from exchange balances',
-            notes: 'Recovered open position on startup',
-          });
-          this.openTrades.set(symbol, {
-            tradeId: syntheticTradeId,
-            entryAtr: 0,
-          });
-        }
-
-        logger.warn(
-          { symbol, quantity: baseBalance, entryPrice },
-          'Rebuilt missing local position from Binance balances'
-        );
-        continue;
-      }
-
-      this.riskManager.upsertPosition({
-        ...restoredPosition,
-        entryPrice: openTrade?.entryPrice ?? localPosition.entryPrice,
-      });
-
-      logger.info(
-        {
-          symbol,
-          exchangeQuantity: baseBalance,
-          localQuantity: localPosition.quantity,
-        },
-        'Reconciled local position with Binance balances'
-      );
+      await this.reconcileSymbolWithExchange(symbol, accountInfo);
     }
 
+    const effectiveAccountBalance =
+      quoteBalance +
+      this.riskManager
+        .getAllPositions()
+        .reduce((sum, position) => sum + position.entryPrice * position.quantity, 0);
+    const hasOpenPositions = this.riskManager.getAllPositions().length > 0;
+    const balanceDelta = effectiveAccountBalance - previousEffectiveBalance;
+    const treatAsExternalCashFlow =
+      !hasOpenPositions && Math.abs(balanceDelta) >= Math.max(25, previousEffectiveBalance * 0.05);
+
+    this.riskManager.setAccountBalance(effectiveAccountBalance, {
+      treatAsExternalCashFlow,
+      reason: treatAsExternalCashFlow
+        ? 'spot account cash flow detected during exchange reconciliation'
+        : 'exchange reconciliation',
+    });
+
     this.normalizeLocalOrderState('exchange reconciliation');
+  }
+
+  private async reconcileSymbolWithExchange(
+    symbol: string,
+    accountInfoOverride?: AccountInfo
+  ): Promise<void> {
+    const accountInfo = accountInfoOverride ?? (await this.orderExecutor.getAccountInfo());
+    this.lastAccountSnapshotAt = accountInfo.updateTime || Date.now();
+    const baseAsset = this.baseAssets[symbol];
+    const baseBalance = this.getAssetQuantity(accountInfo, baseAsset);
+    const ticker = await this.marketDataProvider.getTicker(symbol);
+    const tradingRules = await this.orderExecutor.getSymbolTradingRules(symbol);
+    const baseNotional = baseBalance * ticker.price;
+    const localPosition = this.riskManager.getPosition(symbol);
+    const openTradeState = this.openTrades.get(symbol);
+    const openTrade = openTradeState
+      ? this.journal.getTrade(openTradeState.tradeId)
+      : undefined;
+
+    if (baseBalance <= 0 || baseNotional < tradingRules.minNotional) {
+      if (localPosition) {
+        logger.warn(
+          {
+            symbol,
+            baseAsset,
+            baseBalance,
+            baseNotional,
+            minNotional: tradingRules.minNotional,
+          },
+          'Clearing local position because Binance reports only non-tradable base-asset dust'
+        );
+        this.riskManager.removePosition(symbol);
+        this.openTrades.delete(symbol);
+      }
+      return;
+    }
+
+    const entryPrice = openTrade?.entryPrice ?? localPosition?.entryPrice ?? ticker.price;
+    const restoredPosition = this.buildPosition(symbol, baseBalance, entryPrice, ticker.price);
+
+    if (!localPosition) {
+      this.riskManager.upsertPosition(restoredPosition);
+
+      if (!openTradeState) {
+        const syntheticTradeId = `RESTORED_${symbol}_${Date.now()}`;
+        this.journal.recordEntry({
+          id: syntheticTradeId,
+          symbol,
+          entryTime: Date.now(),
+          entryPrice,
+          quantity: baseBalance,
+          side: 'BUY',
+          strategyName: 'State Reconciliation',
+          reason: 'Reconstructed from exchange balances',
+          notes: 'Recovered open position on startup',
+        });
+        this.openTrades.set(symbol, {
+          tradeId: syntheticTradeId,
+          entryAtr: 0,
+        });
+      }
+
+      logger.warn(
+        { symbol, quantity: baseBalance, entryPrice },
+        'Rebuilt missing local position from Binance balances'
+      );
+      return;
+    }
+
+    this.riskManager.upsertPosition({
+      ...restoredPosition,
+      entryPrice: openTrade?.entryPrice ?? localPosition.entryPrice,
+    });
+
+    logger.info(
+      {
+        symbol,
+        exchangeQuantity: baseBalance,
+        localQuantity: localPosition.quantity,
+      },
+      'Reconciled local position with Binance balances'
+    );
   }
 
   private buildPosition(

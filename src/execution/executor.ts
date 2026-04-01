@@ -316,6 +316,11 @@ export class OrderExecutor {
     return rules;
   }
 
+  async normalizeSymbolQuantity(symbol: string, quantity: number): Promise<number> {
+    const rules = await this.getSymbolTradingRules(symbol);
+    return this.normalizeQuantity(quantity, rules);
+  }
+
   private async normalizeOrder(order: PreparedOrder): Promise<PreparedOrder> {
     const rules = await this.getSymbolTradingRules(order.symbol);
 
@@ -442,6 +447,10 @@ export class OrderExecutor {
       quantity: this.formatValue(order.quantity),
       recvWindow: String(recvWindow),
     });
+
+    if (order.type === 'MARKET') {
+      params.set('newOrderRespType', 'FULL');
+    }
 
     if (order.price !== undefined && order.type !== 'MARKET') {
       params.set('price', this.formatValue(order.price));

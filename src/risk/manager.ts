@@ -226,8 +226,34 @@ export class RiskManager {
     );
   }
 
-  setAccountBalance(balance: number): void {
-    this.accountBalance = this.ensureFinite(balance, 'updated accountBalance');
+  setAccountBalance(
+    balance: number,
+    options?: {
+      treatAsExternalCashFlow?: boolean;
+      reason?: string;
+    }
+  ): void {
+    const nextBalance = this.ensureFinite(balance, 'updated accountBalance');
+    const previousBalance = this.accountBalance;
+    const delta = nextBalance - previousBalance;
+
+    if (options?.treatAsExternalCashFlow && this.positions.size === 0 && delta !== 0) {
+      this.peakEquity = this.ensureFinite(
+        Math.max(nextBalance, this.peakEquity + delta),
+        'peak equity after external cash flow'
+      );
+      logger.warn(
+        {
+          previousBalance,
+          nextBalance,
+          delta,
+          reason: options.reason ?? 'external cash flow',
+        },
+        'Adjusted risk peak equity baseline for external cash flow'
+      );
+    }
+
+    this.accountBalance = nextBalance;
     this.updatePeakEquity();
   }
 

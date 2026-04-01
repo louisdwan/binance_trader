@@ -120,9 +120,14 @@ Notes:
 Operator note:
 
 - stale local `PENDING` `MARKET` orders are now normalized during persisted-state restore and exchange reconciliation
+- live exit sizing is now clamped to exchange-available base balance before a market sell is submitted
 - real unresolved stale orders should still surface in `/status`
 - `/status.reconciliation.orders` reports how many stale market orders were reclassified to terminal states
 - `/status.openOrderVisibility` should no longer accumulate ancient dead `PENDING` market-order artifacts forever
+
+If Binance still returns `-2010` insufficient balance on a market sell after this change, treat that as a real
+exchange/local state mismatch that needs operator review. The bot should no longer keep retrying an obviously
+oversized local exit quantity unchanged.
 
 ## Benign Warnings You May See
 

@@ -7,6 +7,7 @@ import axios from 'axios';
 import { TradingSystem } from './index';
 import { OrderExecutor, type ExecutionConfig } from './execution';
 import { FileStateStore, type PersistedTradingState } from './runtime/stateStore';
+import { RiskManager } from './risk/manager';
 import type { RiskConfig } from './risk';
 
 const baseExecutionConfig: ExecutionConfig = {
@@ -320,4 +321,165 @@ test('operator status shows stale pending orders before normalization and clears
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test('closePosition sizes exit orders to exchange-available balance', async () => {
+  const { system, tempDir } = await createSystem();
+  const executor = system.getOrderExecutor() as OrderExecutor & {
+    getAssetBalance: (asset: string) => Promise<unknown>;
+    normalizeSymbolQuantity: (symbol: string, quantity: number) => Promise<number>;
+    executeOrder: (order: Record<string, unknown>) => Promise<any>;
+  };
+  const riskManager = system.getRiskManager();
+  const now = Date.now();
+
+  riskManager.openPosition('BTCEUR', 0.0008, 58463.73);
+  system.getJournal().recordEntry({
+    id: 'ORDER_BUY_ACTIVE',
+    symbol: 'BTCEUR',
+    entryTime: now - 60_000,
+    entryPrice: 58463.73,
+    quantity: 0.0008,
+    side: 'BUY',
+    strategyName: 'Test Strategy',
+  });
+  (system as any).openTrades.set('BTCEUR', {
+    tradeId: 'ORDER_BUY_ACTIVE',
+    entryAtr: 20,
+  });
+
+  let submittedQuantity = 0;
+  executor.getAssetBalance = async () => ({ asset: 'BTC', free: 0.00061, locked: 0 });
+  executor.normalizeSymbolQuantity = async (_symbol: string, quantity: number) => quantity;
+  (executor.executeOrder as any) = async (order: Record<string, unknown>) => {
+    submittedQuantity = Number(order.quantity);
+    return {
+      ...order,
+      id: 'ORDER_SELL_ACTIVE',
+      timestamp: now,
+      status: 'FILLED',
+      quantity: Number(order.quantity),
+      filledQuantity: Number(order.quantity),
+      averagePrice: 58800,
+    };
+  };
+
+  try {
+    await (system as any).closePosition('BTCEUR', 58800, 'test exit');
+
+    assert.equal(submittedQuantity, 0.00061);
+    assert.equal(system.getRiskManager().getPosition('BTCEUR'), undefined);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('paused critical state does not recommend resume while open-position failure remains', async () => {
+  const { system, tempDir } = await createSystem();
+  const riskManager = system.getRiskManager();
+
+  try {
+    riskManager.openPosition('BTCEUR', 0.001, 50000);
+    (system as any).state = 'paused';
+    (system as any).pauseReason = 'Manual operator pause';
+    (system as any).lastCycleError = 'Request failed with status code 400';
+
+    const status = system.getOperatorStatus();
+    assert.equal(status.severity, 'critical');
+    assert.equal(status.recommendedAction, 'close-position');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('reconciliation keeps effective account balance aligned with quote cash plus position cost basis', async () => {
+  const { system, tempDir } = await createSystem();
+  const executor = system.getOrderExecutor() as OrderExecutor & {
+    getAccountInfo: () => Promise<unknown>;
+  };
+  const oldTimestamp = Date.now() - 60_000;
+
+  const state: PersistedTradingState = {
+    version: 2,
+    savedAt: Date.now(),
+    symbols: ['BTCEUR'],
+    runtime: {
+      state: 'idle',
+      cycleIntervalMs: 60000,
+      lastCycleStartedAt: null,
+      lastCycleCompletedAt: null,
+      lastCycleError: null,
+    },
+    openTrades: [
+      {
+        symbol: 'BTCEUR',
+        tradeId: 'ORDER_BUY_BALANCE',
+        entryAtr: 50,
+      },
+    ],
+    risk: {
+      positions: [
+        {
+          symbol: 'BTCEUR',
+          quantity: 0.001,
+          entryPrice: 100000,
+          currentPrice: 100000,
+          unrealizedPnL: 0,
+          unrealizedPnLPercent: 0,
+        },
+      ],
+      accountBalance: 1000,
+      realizedPnL: 0,
+      dailyRealizedPnL: 0,
+      peakEquity: 1000,
+      currentDay: new Date().toISOString().slice(0, 10),
+    },
+    journal: [
+      {
+        id: 'ORDER_BUY_BALANCE',
+        symbol: 'BTCEUR',
+        entryTime: oldTimestamp,
+        entryPrice: 100000,
+        quantity: 0.001,
+        side: 'BUY',
+        strategyName: 'Test Strategy',
+      },
+    ],
+    orders: [],
+  };
+
+  executor.getAccountInfo = async () => ({
+    canTrade: true,
+    canWithdraw: true,
+    canDeposit: true,
+    updateTime: Date.now(),
+    balances: [
+      { asset: 'EUR', free: 900, locked: 0 },
+      { asset: 'BTC', free: 0.001, locked: 0 },
+    ],
+  });
+
+  try {
+    await system.restoreFromState(state);
+
+    assert.equal(system.getRiskManager().getAccountBalance(), 1000);
+    assert.equal(system.getStatus().riskMetrics.totalExposure, 52);
+    assert.equal(system.getStatus().riskMetrics.unrealizedPnL, -48);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('external cash transfer with no open positions shifts drawdown baseline instead of triggering fake drawdown', () => {
+  const riskManager = new RiskManager(baseRiskConfig, 1000);
+
+  riskManager.setAccountBalance(600, {
+    treatAsExternalCashFlow: true,
+    reason: 'transfer to futures wallet',
+  });
+
+  const metrics = riskManager.getRiskMetrics();
+  assert.equal(riskManager.getAccountBalance(), 600);
+  assert.equal(metrics.drawdownPercent, 0);
+  assert.equal(metrics.drawdown, 0);
 });
