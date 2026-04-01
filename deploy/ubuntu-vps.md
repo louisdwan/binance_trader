@@ -97,6 +97,8 @@ curl http://127.0.0.1:3002/health
 curl http://127.0.0.1:3002/status -H "Authorization: Bearer replace_with_long_random_token"
 ```
 
+`/health` is for liveness checks. Use `/status` for operator supervision and strategy state.
+
 ## 7. Private operator access from your own machine
 
 Run this from your local machine:

@@ -51,6 +51,153 @@ type TradingSystemStatus = {
   dryRun: boolean | undefined;
 };
 
+type StatusSeverity = 'ok' | 'warning' | 'critical';
+type RecommendedAction = 'none' | 'pause' | 'resume' | 'close-position' | 'kill-switch';
+type OperatorStateCode =
+  | 'idle'
+  | 'running-cycle'
+  | 'paused-manual'
+  | 'awaiting-next-cycle'
+  | 'position-open'
+  | 'risk-blocked'
+  | 'cycle-error'
+  | 'stale-open-orders';
+type FailureType =
+  | 'market-data'
+  | 'exchange'
+  | 'risk'
+  | 'validation'
+  | 'state'
+  | 'operator'
+  | 'unknown';
+
+type OperatorLastError = {
+  type: FailureType;
+  source: string;
+  message: string;
+  occurredAt: number;
+};
+
+type OperatorHealthPayload = {
+  ok: boolean;
+  service: 'binance-trader';
+  time: number;
+  uptimeMs: number;
+  state: SystemState;
+  isCycleRunning: boolean;
+  authRequired: boolean;
+  status: TradingSystemStatus;
+  deprecated: {
+    statusInHealth: boolean;
+    statusEndpoint: '/status';
+  };
+};
+
+type OperatorStatusPayload = TradingSystemStatus & {
+  observedAt: number;
+  timestamps: {
+    processStartedAt: number;
+    stateUpdatedAt: number;
+    lastCycleStartedAt: number | null;
+    lastCycleCompletedAt: number | null;
+    lastSuccessfulCycleAt: number | null;
+    accountSnapshotAt: number | null;
+    journalUpdatedAt: number | null;
+    statusGeneratedAt: number;
+  };
+  freshness: {
+    cycleAgeMs: number | null;
+    lastSuccessfulCycleAgeMs: number | null;
+    accountSnapshotAgeMs: number | null;
+    journalAgeMs: number | null;
+  };
+  operatorState: {
+    mode: 'active' | 'idle' | 'paused';
+    reasonCode: OperatorStateCode;
+    reason: string;
+  };
+  severity: StatusSeverity;
+  recommendedAction: RecommendedAction;
+  recommendedActionReason: string;
+  controls: {
+    pauseAvailable: boolean;
+    resumeAvailable: boolean;
+    closePositionAvailable: boolean;
+    killSwitchAvailable: false;
+  };
+  riskVisibility: {
+    totalExposure: number;
+    perSymbolExposure: Array<{
+      symbol: string;
+      quantity: number;
+      notional: number;
+      unrealizedPnL: number;
+      unrealizedPnLPercent: number;
+      holdingTimeMs: number | null;
+      protectiveState: {
+        active: boolean;
+        mode: 'bot-managed-atr-stop' | 'none';
+        stopPrice: number | null;
+        takeProfitPrice: number | null;
+      };
+    }>;
+    rollingDrawdown: {
+      current: number;
+      percent: number;
+      peakEquity: number;
+    };
+    lossStreak: {
+      current: number;
+      worstRecent: number;
+    };
+  };
+  openOrderVisibility: {
+    totalOpenOrders: number;
+    staleThresholdMs: number;
+    staleOpenOrders: Array<{
+      id?: string;
+      symbol: string;
+      side: string;
+      type: string;
+      status: string;
+      ageMs: number;
+      stale: boolean;
+    }>;
+    orders: Array<{
+      id?: string;
+      symbol: string;
+      side: string;
+      type: string;
+      status: string;
+      price?: number;
+      quantity: number;
+      timestamp: number;
+      ageMs: number;
+      stale: boolean;
+    }>;
+  };
+  performance: {
+    feeAware: boolean;
+    averageHoldingTimeMs: number | null;
+    rollingPnL: {
+      last24h: number;
+      last7d: number;
+      last30d: number;
+    };
+    symbolSummary: Array<{
+      symbol: string;
+      trades: number;
+      winRate: number;
+      totalPnL: number;
+      averageHoldingTimeMs: number | null;
+    }>;
+  };
+  failures: {
+    countsByType: Record<FailureType, number>;
+    lastError: OperatorLastError | null;
+  };
+};
+
 type ControlServerConfig = {
   host: string;
   port: number;
@@ -245,6 +392,7 @@ async function loadBotConfig(): Promise<BotConfig> {
 }
 
 class TradingSystem {
+  private static readonly staleOpenOrderThresholdMs = 5 * 60 * 1000;
   private marketDataProvider: MarketDataProvider;
   private orderExecutor: OrderExecutor;
   private riskManager: RiskManager;
@@ -266,9 +414,25 @@ class TradingSystem {
   private loopTimer: NodeJS.Timeout | null = null;
   private cyclePromise: Promise<void> | null = null;
   private state: SystemState = 'idle';
+  private readonly startedAt: number = Date.now();
+  private stateUpdatedAt: number = this.startedAt;
   private lastCycleStartedAt: number | null = null;
   private lastCycleCompletedAt: number | null = null;
+  private lastSuccessfulCycleAt: number | null = null;
   private lastCycleError: string | null = null;
+  private pauseReason: string | null = null;
+  private lastAccountSnapshotAt: number | null = null;
+  private lastJournalUpdatedAt: number | null = null;
+  private lastError: OperatorLastError | null = null;
+  private failureCounts: Record<FailureType, number> = {
+    'market-data': 0,
+    exchange: 0,
+    risk: 0,
+    validation: 0,
+    state: 0,
+    operator: 0,
+    unknown: 0,
+  };
 
   constructor(
     marketDataProvider: MarketDataProvider,
@@ -485,6 +649,7 @@ class TradingSystem {
         reason: context.selectedBuySignal.reasoning,
         notes: `Confidence: ${context.selectedBuySignal.confidence.toFixed(2)}`,
       });
+      this.lastJournalUpdatedAt = order.timestamp;
       this.openTrades.set(context.symbol, {
         tradeId: order.id!,
         entryAtr: context.atr,
@@ -536,6 +701,8 @@ class TradingSystem {
     }
 
     this.state = 'paused';
+    this.pauseReason = 'Manual operator pause';
+    this.stateUpdatedAt = Date.now();
     logger.warn({ symbols: this.symbols }, 'Trading paused');
     await this.persistState('manual pause');
   }
@@ -546,6 +713,8 @@ class TradingSystem {
     }
 
     this.state = 'idle';
+    this.pauseReason = null;
+    this.stateUpdatedAt = Date.now();
     logger.warn({ symbols: this.symbols }, 'Trading resumed');
     await this.persistState('manual resume');
   }
@@ -589,6 +758,458 @@ class TradingSystem {
     };
   }
 
+  getOperatorStatus(): OperatorStatusPayload {
+    const now = Date.now();
+    const baseStatus = this.getStatus();
+    const riskBlockers = this.getRiskBlockers();
+    const openOrders = this.orderExecutor.getAllOrders()
+      .filter((order) => order.status === 'OPEN' || order.status === 'PENDING')
+      .map((order) => {
+        const ageMs = Math.max(0, now - order.timestamp);
+        return {
+          id: order.id,
+          symbol: order.symbol,
+          side: order.side,
+          type: order.type,
+          status: order.status,
+          price: order.price,
+          quantity: order.quantity,
+          timestamp: order.timestamp,
+          ageMs,
+          stale: ageMs > TradingSystem.staleOpenOrderThresholdMs,
+        };
+      });
+    const staleOpenOrders = openOrders.filter((order) => order.stale);
+    const trades = this.journal.getAllTrades();
+    const closedTrades = trades.filter((trade) => trade.exitTime !== undefined);
+    const riskState = this.riskManager.getState();
+    const perSymbolExposure = baseStatus.openPositions.map((position) =>
+      this.buildExposureView(position.symbol, position.quantity, position.entryPrice, position.currentPrice)
+    );
+    const operatorState = this.getOperatorState(
+      baseStatus,
+      staleOpenOrders.length > 0,
+      riskBlockers.length > 0
+    );
+    const severity = this.getSeverity(baseStatus, staleOpenOrders.length > 0);
+    const recommendation = this.getRecommendedAction(
+      baseStatus,
+      operatorState.reasonCode,
+      severity,
+      staleOpenOrders.length > 0
+    );
+
+    return {
+      ...baseStatus,
+      observedAt: now,
+      timestamps: {
+        processStartedAt: this.startedAt,
+        stateUpdatedAt: this.stateUpdatedAt,
+        lastCycleStartedAt: this.lastCycleStartedAt,
+        lastCycleCompletedAt: this.lastCycleCompletedAt,
+        lastSuccessfulCycleAt: this.lastSuccessfulCycleAt,
+        accountSnapshotAt: this.lastAccountSnapshotAt,
+        journalUpdatedAt: this.lastJournalUpdatedAt,
+        statusGeneratedAt: now,
+      },
+      freshness: {
+        cycleAgeMs:
+          this.lastCycleCompletedAt !== null ? Math.max(0, now - this.lastCycleCompletedAt) : null,
+        lastSuccessfulCycleAgeMs:
+          this.lastSuccessfulCycleAt !== null ? Math.max(0, now - this.lastSuccessfulCycleAt) : null,
+        accountSnapshotAgeMs:
+          this.lastAccountSnapshotAt !== null ? Math.max(0, now - this.lastAccountSnapshotAt) : null,
+        journalAgeMs:
+          this.lastJournalUpdatedAt !== null ? Math.max(0, now - this.lastJournalUpdatedAt) : null,
+      },
+      operatorState,
+      severity,
+      recommendedAction: recommendation.action,
+      recommendedActionReason: recommendation.reason,
+      controls: {
+        pauseAvailable: this.state !== 'paused',
+        resumeAvailable: this.state === 'paused',
+        closePositionAvailable: baseStatus.openPositions.length > 0,
+        killSwitchAvailable: false,
+      },
+      riskVisibility: {
+        totalExposure: baseStatus.riskMetrics.totalExposure,
+        perSymbolExposure,
+        rollingDrawdown: {
+          current: baseStatus.riskMetrics.drawdown,
+          percent: baseStatus.riskMetrics.drawdownPercent,
+          peakEquity: riskState.peakEquity,
+        },
+        lossStreak: {
+          current: this.calculateCurrentLossStreak(closedTrades),
+          worstRecent: this.calculateWorstRecentLossStreak(closedTrades, 20),
+        },
+      },
+      openOrderVisibility: {
+        totalOpenOrders: openOrders.length,
+        staleThresholdMs: TradingSystem.staleOpenOrderThresholdMs,
+        staleOpenOrders: staleOpenOrders.map((order) => ({ ...order })),
+        orders: openOrders,
+      },
+      performance: {
+        feeAware: false,
+        averageHoldingTimeMs: this.calculateAverageHoldingTimeMs(closedTrades),
+        rollingPnL: {
+          last24h: this.calculateRollingPnl(closedTrades, now - 24 * 60 * 60 * 1000),
+          last7d: this.calculateRollingPnl(closedTrades, now - 7 * 24 * 60 * 60 * 1000),
+          last30d: this.calculateRollingPnl(closedTrades, now - 30 * 24 * 60 * 60 * 1000),
+        },
+        symbolSummary: this.buildSymbolPerformanceSummary(closedTrades),
+      },
+      failures: {
+        countsByType: { ...this.failureCounts },
+        lastError: this.lastError ? { ...this.lastError } : null,
+      },
+    };
+  }
+
+  getHealthStatus(authRequired: boolean): OperatorHealthPayload {
+    return {
+      ok: true,
+      service: 'binance-trader',
+      time: Date.now(),
+      uptimeMs: Math.floor(process.uptime() * 1000),
+      state: this.state,
+      isCycleRunning: this.cyclePromise !== null,
+      authRequired,
+      status: this.getStatus(),
+      deprecated: {
+        statusInHealth: true,
+        statusEndpoint: '/status',
+      },
+    };
+  }
+
+  private buildExposureView(
+    symbol: string,
+    quantity: number,
+    entryPrice: number,
+    currentPrice: number
+  ): OperatorStatusPayload['riskVisibility']['perSymbolExposure'][number] {
+    const tradeState = this.openTrades.get(symbol);
+    const trade = tradeState ? this.journal.getTrade(tradeState.tradeId) : undefined;
+    const holdingTimeMs = trade ? Math.max(0, Date.now() - trade.entryTime) : null;
+    const unrealizedPnL = (currentPrice - entryPrice) * quantity;
+    const unrealizedPnLPercent = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
+    const stopPrice = tradeState ? entryPrice - tradeState.entryAtr * this.stopLossAtrMultiple : null;
+    const takeProfitPrice = tradeState ? entryPrice + tradeState.entryAtr * this.takeProfitAtrMultiple : null;
+
+    return {
+      symbol,
+      quantity,
+      notional: quantity * currentPrice,
+      unrealizedPnL,
+      unrealizedPnLPercent,
+      holdingTimeMs,
+      protectiveState: {
+        active: Boolean(tradeState && tradeState.entryAtr > 0),
+        mode: tradeState && tradeState.entryAtr > 0 ? 'bot-managed-atr-stop' : 'none',
+        stopPrice,
+        takeProfitPrice,
+      },
+    };
+  }
+
+  private getRiskBlockers(): string[] {
+    const metrics = this.riskManager.getRiskMetrics();
+    const riskState = this.riskManager.getState();
+    const riskConfig = this.riskManager.getConfig();
+    const dailyLoss = Math.max(0, -riskState.dailyRealizedPnL);
+    const dailyLossPercent =
+      riskState.peakEquity > 0 ? (dailyLoss / riskState.peakEquity) * 100 : 0;
+    const blockers: string[] = [];
+
+    if (metrics.drawdownPercent > riskConfig.maxDrawdownPercent) {
+      blockers.push(
+        `Drawdown ${metrics.drawdownPercent.toFixed(2)}% exceeds limit ${riskConfig.maxDrawdownPercent.toFixed(2)}%`
+      );
+    }
+
+    if (dailyLoss > riskConfig.dailyLossLimit) {
+      blockers.push(
+        `Daily loss ${dailyLoss.toFixed(2)} exceeds limit ${riskConfig.dailyLossLimit.toFixed(2)}`
+      );
+    }
+
+    if (dailyLossPercent > riskConfig.maxDailyLossPercent) {
+      blockers.push(
+        `Daily loss ${dailyLossPercent.toFixed(2)}% exceeds limit ${riskConfig.maxDailyLossPercent.toFixed(2)}%`
+      );
+    }
+
+    return blockers;
+  }
+
+  private getOperatorState(
+    status: TradingSystemStatus,
+    hasStaleOpenOrders: boolean,
+    riskBlocked: boolean
+  ): OperatorStatusPayload['operatorState'] {
+    if (status.state === 'paused') {
+      return {
+        mode: 'paused',
+        reasonCode: 'paused-manual',
+        reason: this.pauseReason ?? 'Trading paused by operator',
+      };
+    }
+
+    if (status.isCycleRunning) {
+      return {
+        mode: 'active',
+        reasonCode: 'running-cycle',
+        reason: 'Trading cycle is currently executing',
+      };
+    }
+
+    if (riskBlocked) {
+      return {
+        mode: 'idle',
+        reasonCode: 'risk-blocked',
+        reason: 'Risk limits currently block new entries',
+      };
+    }
+
+    if (status.lastCycleError) {
+      return {
+        mode: 'idle',
+        reasonCode: 'cycle-error',
+        reason: 'Most recent trading cycle failed',
+      };
+    }
+
+    if (hasStaleOpenOrders) {
+      return {
+        mode: 'idle',
+        reasonCode: 'stale-open-orders',
+        reason: 'Open or pending orders have exceeded the expected freshness window',
+      };
+    }
+
+    if (status.openPositions.length > 0) {
+      return {
+        mode: 'idle',
+        reasonCode: 'position-open',
+        reason: 'Bot is supervising an open position',
+      };
+    }
+
+    return {
+      mode: 'idle',
+      reasonCode: 'awaiting-next-cycle',
+      reason: 'Bot is waiting for the next scheduled trading cycle',
+    };
+  }
+
+  private getSeverity(
+    status: TradingSystemStatus,
+    hasStaleOpenOrders: boolean
+  ): StatusSeverity {
+    const riskBlockers = this.getRiskBlockers();
+
+    if (status.lastCycleError || riskBlockers.length > 0) {
+      return 'critical';
+    }
+
+    if (hasStaleOpenOrders || status.state === 'paused' || status.openPositions.length > 0) {
+      return 'warning';
+    }
+
+    return 'ok';
+  }
+
+  private getRecommendedAction(
+    status: TradingSystemStatus,
+    reasonCode: OperatorStateCode,
+    severity: StatusSeverity,
+    hasStaleOpenOrders: boolean
+  ): { action: RecommendedAction; reason: string } {
+    if (reasonCode === 'paused-manual') {
+      const blockers = this.getRiskBlockers();
+      if (blockers.length === 0) {
+        return {
+          action: 'resume',
+          reason: 'Bot is manually paused and no current risk blocker prevents resuming',
+        };
+      }
+
+      return {
+        action: 'none',
+        reason: `Bot is paused and resume is blocked: ${blockers.join('; ')}`,
+      };
+    }
+
+    if (severity === 'critical' && status.openPositions.length > 0) {
+      return {
+        action: 'close-position',
+        reason: 'Critical state detected while a live position remains open',
+      };
+    }
+
+    if (severity === 'critical') {
+      return {
+        action: 'pause',
+        reason: 'Critical operator state detected; stop new cycles until reviewed',
+      };
+    }
+
+    if (hasStaleOpenOrders) {
+      return {
+        action: 'pause',
+        reason: 'Pending or open orders appear stale and should be reviewed before new actions',
+      };
+    }
+
+    if (status.openPositions.length > 0) {
+      return {
+        action: 'none',
+        reason: 'Bot is managing an open position within expected bounds',
+      };
+    }
+
+    return {
+      action: 'none',
+      reason: 'No operator intervention is currently recommended',
+    };
+  }
+
+  private calculateCurrentLossStreak(trades: Array<{ pnl?: number }>): number {
+    let streak = 0;
+
+    for (let index = trades.length - 1; index >= 0; index -= 1) {
+      const pnl = trades[index].pnl ?? 0;
+      if (pnl < 0) {
+        streak += 1;
+        continue;
+      }
+      break;
+    }
+
+    return streak;
+  }
+
+  private calculateWorstRecentLossStreak(
+    trades: Array<{ pnl?: number }>,
+    lookback: number
+  ): number {
+    let current = 0;
+    let worst = 0;
+
+    for (const trade of trades.slice(-lookback)) {
+      const pnl = trade.pnl ?? 0;
+      if (pnl < 0) {
+        current += 1;
+        worst = Math.max(worst, current);
+      } else {
+        current = 0;
+      }
+    }
+
+    return worst;
+  }
+
+  private calculateAverageHoldingTimeMs(
+    trades: Array<{ entryTime: number; exitTime?: number }>
+  ): number | null {
+    const durations = trades
+      .map((trade) => (trade.exitTime !== undefined ? trade.exitTime - trade.entryTime : null))
+      .filter((duration): duration is number => duration !== null && duration >= 0);
+
+    if (durations.length === 0) {
+      return null;
+    }
+
+    return durations.reduce((sum, duration) => sum + duration, 0) / durations.length;
+  }
+
+  private calculateRollingPnl(
+    trades: Array<{ exitTime?: number; pnl?: number }>,
+    since: number
+  ): number {
+    return trades.reduce((sum, trade) => {
+      if (trade.exitTime === undefined || trade.exitTime < since) {
+        return sum;
+      }
+
+      return sum + (trade.pnl ?? 0);
+    }, 0);
+  }
+
+  private buildSymbolPerformanceSummary(
+    trades: Array<{
+      symbol: string;
+      pnl?: number;
+      entryTime: number;
+      exitTime?: number;
+    }>
+  ): OperatorStatusPayload['performance']['symbolSummary'] {
+    const symbols = Array.from(new Set(trades.map((trade) => trade.symbol)));
+
+    return symbols.map((symbol) => {
+      const symbolTrades = trades.filter((trade) => trade.symbol === symbol);
+      const wins = symbolTrades.filter((trade) => (trade.pnl ?? 0) > 0).length;
+
+      return {
+        symbol,
+        trades: symbolTrades.length,
+        winRate: symbolTrades.length > 0 ? (wins / symbolTrades.length) * 100 : 0,
+        totalPnL: symbolTrades.reduce((sum, trade) => sum + (trade.pnl ?? 0), 0),
+        averageHoldingTimeMs: this.calculateAverageHoldingTimeMs(symbolTrades),
+      };
+    });
+  }
+
+  private recordFailure(source: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const type = this.classifyFailure(message, source);
+    this.failureCounts[type] += 1;
+    this.lastError = {
+      type,
+      source,
+      message,
+      occurredAt: Date.now(),
+    };
+  }
+
+  private classifyFailure(message: string, source: string): FailureType {
+    const haystack = `${source} ${message}`.toLowerCase();
+
+    if (haystack.includes('candle') || haystack.includes('ticker') || haystack.includes('market')) {
+      return 'market-data';
+    }
+
+    if (
+      haystack.includes('binance') ||
+      haystack.includes('exchange') ||
+      haystack.includes('order') ||
+      haystack.includes('account')
+    ) {
+      return 'exchange';
+    }
+
+    if (haystack.includes('risk') || haystack.includes('drawdown') || haystack.includes('loss')) {
+      return 'risk';
+    }
+
+    if (haystack.includes('invalid') || haystack.includes('missing') || haystack.includes('unsupported')) {
+      return 'validation';
+    }
+
+    if (haystack.includes('state') || haystack.includes('persist') || haystack.includes('restore')) {
+      return 'state';
+    }
+
+    if (haystack.includes('manual') || haystack.includes('operator') || haystack.includes('control')) {
+      return 'operator';
+    }
+
+    return 'unknown';
+  }
+
   getJournal(): TradeJournal {
     return this.journal;
   }
@@ -619,6 +1240,11 @@ class TradingSystem {
       }
 
       this.journal.restoreTrades(state.journal);
+      this.lastJournalUpdatedAt =
+        state.journal.reduce((latest, trade) => {
+          const candidate = trade.exitTime ?? trade.entryTime;
+          return Math.max(latest, candidate);
+        }, 0) || null;
       this.orderExecutor.restoreOrders(state.orders);
       this.riskManager.restoreState(state.risk);
       this.openTrades = new Map(
@@ -632,8 +1258,11 @@ class TradingSystem {
       this.loopIntervalMs = state.runtime.cycleIntervalMs;
       this.lastCycleStartedAt = state.runtime.lastCycleStartedAt;
       this.lastCycleCompletedAt = state.runtime.lastCycleCompletedAt;
+      this.lastSuccessfulCycleAt = state.runtime.lastCycleCompletedAt;
       this.lastCycleError = state.runtime.lastCycleError;
       this.state = state.runtime.state === 'paused' ? 'paused' : 'idle';
+      this.pauseReason = this.state === 'paused' ? 'Restored paused state from persisted runtime' : null;
+      this.stateUpdatedAt = Date.now();
 
       logger.info(
         {
@@ -659,6 +1288,7 @@ class TradingSystem {
     this.lastCycleStartedAt = Date.now();
     this.lastCycleError = null;
     this.state = 'running';
+    this.stateUpdatedAt = this.lastCycleStartedAt;
 
     const cycle = this.runCycle();
     this.cyclePromise = cycle;
@@ -666,15 +1296,18 @@ class TradingSystem {
     try {
       await cycle;
       this.lastCycleCompletedAt = Date.now();
+      this.lastSuccessfulCycleAt = this.lastCycleCompletedAt;
     } catch (error) {
       this.lastCycleCompletedAt = Date.now();
       this.lastCycleError =
         error instanceof Error ? error.message : 'Unknown cycle error';
+      this.recordFailure('cycle', error);
       logger.error({ error }, 'Managed cycle failed');
     } finally {
       this.cyclePromise = null;
       if (this.state === 'running') {
         this.state = 'idle';
+        this.stateUpdatedAt = Date.now();
       }
       await this.persistState('cycle completion');
     }
@@ -764,6 +1397,7 @@ class TradingSystem {
         order.averagePrice ?? currentPrice,
         order.timestamp
       );
+      this.lastJournalUpdatedAt = order.timestamp;
       this.openTrades.delete(symbol);
     }
 
@@ -856,6 +1490,7 @@ class TradingSystem {
 
   private async reconcileWithExchange(): Promise<void> {
     const accountInfo = await this.orderExecutor.getAccountInfo();
+    this.lastAccountSnapshotAt = accountInfo.updateTime || Date.now();
     const quoteBalance = this.getAssetQuantity(accountInfo, this.quoteAsset);
     this.riskManager.setAccountBalance(quoteBalance);
 
@@ -1059,7 +1694,7 @@ class ControlServer {
       const url = new URL(req.url || '/', 'http://localhost');
 
       if (method === 'GET' && url.pathname === '/health') {
-        this.sendJson(res, 200, { ok: true, status: this.system.getStatus() });
+        this.sendJson(res, 200, this.system.getHealthStatus(Boolean(this.config.authToken)));
         return;
       }
 
@@ -1069,19 +1704,19 @@ class ControlServer {
       }
 
       if (method === 'GET' && url.pathname === '/status') {
-        this.sendJson(res, 200, this.system.getStatus());
+        this.sendJson(res, 200, this.system.getOperatorStatus());
         return;
       }
 
       if (method === 'POST' && url.pathname === '/pause') {
         await this.system.pauseTrading();
-        this.sendJson(res, 200, this.system.getStatus());
+        this.sendJson(res, 200, this.system.getOperatorStatus());
         return;
       }
 
       if (method === 'POST' && url.pathname === '/resume') {
         await this.system.resumeTrading();
-        this.sendJson(res, 200, this.system.getStatus());
+        this.sendJson(res, 200, this.system.getOperatorStatus());
         return;
       }
 
@@ -1097,7 +1732,7 @@ class ControlServer {
         );
         this.sendJson(res, 200, {
           closed,
-          status: this.system.getStatus(),
+          status: this.system.getOperatorStatus(),
         });
         return;
       }
