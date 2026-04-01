@@ -17,6 +17,8 @@ export type PersistedRuntimeState = {
   lastCycleStartedAt: number | null;
   lastCycleCompletedAt: number | null;
   lastCycleError: string | null;
+  lastBaselineResetAt?: number | null;
+  lastBaselineResetReason?: string | null;
 };
 
 export type PersistedTradingState = {

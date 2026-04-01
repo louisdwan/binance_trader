@@ -128,7 +128,15 @@ curl -X POST http://127.0.0.1:3002/close-position \
   -H "Authorization: Bearer replace_with_long_random_token" \
   -H "Content-Type: application/json" \
   -d '{"symbol":"BTCEUR","reason":"Manual close requested"}'
+curl -X POST http://127.0.0.1:3002/reset-baseline \
+  -H "Authorization: Bearer replace_with_long_random_token" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"Confirmed transfer to futures wallet"}'
 ```
+
+Use `POST /reset-baseline` only after a confirmed external capital transfer and only while the spot bot has no
+open positions, no open or pending orders, and no active cycle. If those conditions are not met, the API returns
+`409` and leaves the drawdown baseline unchanged.
 
 ## 8. Move to live mode
 

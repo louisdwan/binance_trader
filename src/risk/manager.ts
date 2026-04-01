@@ -257,6 +257,26 @@ export class RiskManager {
     this.updatePeakEquity();
   }
 
+  resetDrawdownBaseline(reason?: string): { previousPeakEquity: number; nextPeakEquity: number } {
+    const previousPeakEquity = this.peakEquity;
+    const nextPeakEquity = this.ensureFinite(this.getEquity(), 'reset drawdown baseline equity');
+    this.peakEquity = nextPeakEquity;
+
+    logger.warn(
+      {
+        previousPeakEquity,
+        nextPeakEquity,
+        reason: reason ?? 'manual operator reset',
+      },
+      'Reset risk drawdown baseline'
+    );
+
+    return {
+      previousPeakEquity,
+      nextPeakEquity,
+    };
+  }
+
   upsertPosition(position: Position): void {
     this.positions.set(position.symbol, {
       ...position,

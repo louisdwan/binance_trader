@@ -108,6 +108,7 @@ type OperatorStatusPayload = TradingSystemStatus & {
     lastSuccessfulCycleAt: number | null;
     accountSnapshotAt: number | null;
     journalUpdatedAt: number | null;
+    lastBaselineResetAt: number | null;
     statusGeneratedAt: number;
   };
   freshness: {
@@ -128,7 +129,14 @@ type OperatorStatusPayload = TradingSystemStatus & {
     pauseAvailable: boolean;
     resumeAvailable: boolean;
     closePositionAvailable: boolean;
+    resetBaselineAvailable: boolean;
     killSwitchAvailable: false;
+  };
+  baselineReset: {
+    available: boolean;
+    blockers: string[];
+    lastResetAt: number | null;
+    lastResetReason: string | null;
   };
   riskVisibility: {
     totalExposure: number;
@@ -435,6 +443,8 @@ class TradingSystem {
   private pauseReason: string | null = null;
   private lastAccountSnapshotAt: number | null = null;
   private lastJournalUpdatedAt: number | null = null;
+  private lastBaselineResetAt: number | null = null;
+  private lastBaselineResetReason: string | null = null;
   private lastError: OperatorLastError | null = null;
   private lastOrderNormalization: OperatorStatusPayload['reconciliation']['orders'] = {
     normalizedAt: 0,
@@ -764,6 +774,25 @@ class TradingSystem {
     return true;
   }
 
+  async resetRiskBaseline(
+    reason: string = 'Manual operator baseline reset'
+  ): Promise<{ previousPeakEquity: number; nextPeakEquity: number }> {
+    const blockers = this.getBaselineResetBlockers();
+
+    if (blockers.length > 0) {
+      const message = `Baseline reset blocked: ${blockers.join('; ')}`;
+      this.recordFailure('operator baseline reset', new Error(message));
+      throw new Error(message);
+    }
+
+    const result = this.riskManager.resetDrawdownBaseline(reason);
+    this.lastBaselineResetAt = Date.now();
+    this.lastBaselineResetReason = reason;
+    this.stateUpdatedAt = this.lastBaselineResetAt;
+    await this.persistState('manual baseline reset');
+    return result;
+  }
+
   getStatus(): TradingSystemStatus {
     return {
       symbol: this.symbols[0] ?? '',
@@ -788,6 +817,7 @@ class TradingSystem {
     const now = Date.now();
     const baseStatus = this.getStatus();
     const riskBlockers = this.getRiskBlockers();
+    const baselineResetBlockers = this.getBaselineResetBlockers();
     const openOrders = this.orderExecutor.getAllOrders()
       .filter((order) => order.status === 'OPEN' || order.status === 'PENDING')
       .map((order) => {
@@ -836,6 +866,7 @@ class TradingSystem {
         lastSuccessfulCycleAt: this.lastSuccessfulCycleAt,
         accountSnapshotAt: this.lastAccountSnapshotAt,
         journalUpdatedAt: this.lastJournalUpdatedAt,
+        lastBaselineResetAt: this.lastBaselineResetAt,
         statusGeneratedAt: now,
       },
       freshness: {
@@ -856,7 +887,14 @@ class TradingSystem {
         pauseAvailable: this.state !== 'paused',
         resumeAvailable: this.state === 'paused',
         closePositionAvailable: baseStatus.openPositions.length > 0,
+        resetBaselineAvailable: baselineResetBlockers.length === 0,
         killSwitchAvailable: false,
+      },
+      baselineReset: {
+        available: baselineResetBlockers.length === 0,
+        blockers: baselineResetBlockers,
+        lastResetAt: this.lastBaselineResetAt,
+        lastResetReason: this.lastBaselineResetReason,
       },
       riskVisibility: {
         totalExposure: baseStatus.riskMetrics.totalExposure,
@@ -972,6 +1010,28 @@ class TradingSystem {
       blockers.push(
         `Daily loss ${dailyLossPercent.toFixed(2)}% exceeds limit ${riskConfig.maxDailyLossPercent.toFixed(2)}%`
       );
+    }
+
+    return blockers;
+  }
+
+  private getBaselineResetBlockers(): string[] {
+    const blockers: string[] = [];
+    const openPositions = this.riskManager.getAllPositions();
+    const openOrders = this.orderExecutor
+      .getAllOrders()
+      .filter((order) => order.status === 'OPEN' || order.status === 'PENDING');
+
+    if (this.cyclePromise !== null) {
+      blockers.push('trading cycle is currently running');
+    }
+
+    if (openPositions.length > 0) {
+      blockers.push('open positions remain');
+    }
+
+    if (openOrders.length > 0) {
+      blockers.push('open or pending orders remain');
     }
 
     return blockers;
@@ -1408,6 +1468,8 @@ class TradingSystem {
       this.lastCycleError = state.runtime.lastCycleError;
       this.state = state.runtime.state === 'paused' ? 'paused' : 'idle';
       this.pauseReason = this.state === 'paused' ? 'Restored paused state from persisted runtime' : null;
+      this.lastBaselineResetAt = state.runtime.lastBaselineResetAt ?? null;
+      this.lastBaselineResetReason = state.runtime.lastBaselineResetReason ?? null;
       this.stateUpdatedAt = Date.now();
       this.normalizeLocalOrderState('restored persisted state');
 
@@ -1833,6 +1895,8 @@ class TradingSystem {
         lastCycleStartedAt: this.lastCycleStartedAt,
         lastCycleCompletedAt: this.lastCycleCompletedAt,
         lastCycleError: this.lastCycleError,
+        lastBaselineResetAt: this.lastBaselineResetAt,
+        lastBaselineResetReason: this.lastBaselineResetReason,
       },
       openTrades: Array.from(this.openTrades.entries()).map(([symbol, trade]) => ({
         symbol,
@@ -1956,6 +2020,30 @@ class ControlServer {
           closed,
           status: this.system.getOperatorStatus(),
         });
+        return;
+      }
+
+      if (method === 'POST' && url.pathname === '/reset-baseline') {
+        const body = await this.readJsonBody(req);
+
+        try {
+          const result = await this.system.resetRiskBaseline(
+            typeof body.reason === 'string' && body.reason.trim().length > 0
+              ? body.reason
+              : 'Manual operator baseline reset'
+          );
+          this.sendJson(res, 200, {
+            reset: true,
+            result,
+            status: this.system.getOperatorStatus(),
+          });
+        } catch (error) {
+          this.sendJson(res, 409, {
+            reset: false,
+            error: error instanceof Error ? error.message : 'Baseline reset blocked',
+            status: this.system.getOperatorStatus(),
+          });
+        }
         return;
       }
 

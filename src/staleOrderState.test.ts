@@ -483,3 +483,67 @@ test('external cash transfer with no open positions shifts drawdown baseline ins
   assert.equal(metrics.drawdownPercent, 0);
   assert.equal(metrics.drawdown, 0);
 });
+
+test('baseline reset is available only on a flat book and resets peak equity to current balance', async () => {
+  const { system, tempDir } = await createSystem();
+
+  try {
+    const riskManager = system.getRiskManager();
+    riskManager.setAccountBalance(600, {
+      treatAsExternalCashFlow: false,
+      reason: 'simulated transfer without rebase',
+    });
+
+    let status = system.getOperatorStatus();
+    assert.equal(status.baselineReset.available, true);
+    assert.deepEqual(status.baselineReset.blockers, []);
+    assert.equal(status.riskVisibility.rollingDrawdown.peakEquity, 1000);
+    assert.equal(status.riskVisibility.rollingDrawdown.percent, 40);
+
+    const result = await system.resetRiskBaseline('confirmed transfer to futures wallet');
+    status = system.getOperatorStatus();
+
+    assert.equal(result.previousPeakEquity, 1000);
+    assert.equal(result.nextPeakEquity, 600);
+    assert.equal(status.baselineReset.lastResetReason, 'confirmed transfer to futures wallet');
+    assert.equal(status.riskVisibility.rollingDrawdown.peakEquity, 600);
+    assert.equal(status.riskVisibility.rollingDrawdown.percent, 0);
+    assert.equal(status.controls.resetBaselineAvailable, true);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('baseline reset is blocked while positions or pending orders remain', async () => {
+  const { system, tempDir } = await createSystem();
+  const riskManager = system.getRiskManager();
+  const executor = system.getOrderExecutor();
+
+  try {
+    riskManager.openPosition('BTCEUR', 0.001, 50000);
+    executor.restoreOrders([
+      {
+        id: 'ORDER_PENDING_RESET_BLOCK',
+        symbol: 'BTCEUR',
+        side: 'BUY',
+        type: 'MARKET',
+        quantity: 0.001,
+        price: 50000,
+        status: 'PENDING',
+        timestamp: Date.now(),
+      },
+    ]);
+
+    const status = system.getOperatorStatus();
+    assert.equal(status.baselineReset.available, false);
+    assert.match(status.baselineReset.blockers.join('; '), /open positions remain/);
+    assert.match(status.baselineReset.blockers.join('; '), /open or pending orders remain/);
+
+    await assert.rejects(
+      () => system.resetRiskBaseline('should not pass'),
+      /Baseline reset blocked/
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
